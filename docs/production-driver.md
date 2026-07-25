@@ -74,6 +74,56 @@ FFmpeg's `-itsoffset` on the audio input when calibrating a recording.
 The planned native timestamped capture path is documented in
 [A/V synchronization next steps](next-steps-av-sync.md).
 
+### Calibrating a fixed audio offset
+
+Until the native `capture` path lands, the FFmpeg pipeline above has no
+shared clock between the video pipe and the ALSA input, so recordings can
+show a small, host-dependent fixed offset. Measure it once per host/device
+combination rather than guessing:
+
+1. Record a short clip containing a single sharp, visually and audibly
+   distinct event — a clap, a bell, or a camera flash works well:
+
+   ```sh
+   target/release/handycam stream --output - --semantic-init --quality 20 |
+   ffmpeg \
+     -thread_queue_size 512 -f mjpeg -framerate 25 -i pipe:0 \
+     -thread_queue_size 512 -f alsa -ar 16000 -ac 2 -i hw:1,0 \
+     -map 0:v:0 -map 1:a:0 -c:v copy -c:a pcm_s16le \
+     -af aresample=async=1 calibration.mkv
+   ```
+
+2. Find the event's timestamp in each stream. `ffprobe -show_frames` lists
+   per-frame `pts_time`; visually identify the video frame containing the
+   event, and separately inspect the audio waveform (for example in
+   Audacity, or `ffprobe -f lavfi "amovie=calibration.mkv,astats=metadata=1"`)
+   to find the sample where the clap/flash's audio onset occurs.
+
+3. The difference between the two (`audio_event_time - video_event_time`) is
+   the offset to apply. A positive value means audio arrived late relative to
+   video and should be shifted earlier (or the video delayed); apply it to
+   the *next* recording's audio input, never as a default:
+
+   ```sh
+   ffmpeg \
+     -thread_queue_size 512 -f mjpeg -framerate 25 -i pipe:0 \
+     -itsoffset 0.25 -thread_queue_size 512 -f alsa -ar 16000 -ac 2 -i hw:1,0 \
+     -map 0:v:0 -map 1:a:0 -c:v copy -c:a pcm_s16le \
+     -af aresample=async=1 handycam-record.mkv
+   ```
+
+4. Repeat the measurement at 30 seconds, 5 minutes, and 30 minutes into a
+   longer recording. A consistent offset across all three means the fixed
+   startup skew dominates and `-itsoffset` alone is sufficient. A growing gap
+   means the ALSA and camera clocks are drifting relative to each other;
+   `aresample=async=1` only smooths small differences and cannot correct a
+   fixed offset, so the two problems need to be diagnosed separately.
+
+This calibration is a stopgap. It is host- and device-specific, must be
+redone if the USB topology or audio device changes, and does not correct
+drift. The full fix is native timestamp plumbing, tracked in
+[A/V synchronization next steps](next-steps-av-sync.md).
+
 For applications that need uncompressed frames:
 
 ```sh

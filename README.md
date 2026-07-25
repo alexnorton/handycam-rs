@@ -174,8 +174,10 @@ ffplay -fflags nobuffer -f matroska -i -
 ```
 
 The audio and video clocks are currently independent, so a small fixed offset
-may be needed for a particular host; see the production driver guide for
-details.
+may be needed for a particular host. See "Calibrating a fixed audio offset"
+in the [production driver guide](docs/production-driver.md) for a measurement
+procedure, and [A/V synchronization next steps](docs/next-steps-av-sync.md)
+for the native fix in progress.
 
 ## Documentation
 

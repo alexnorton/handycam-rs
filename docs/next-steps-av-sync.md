@@ -19,7 +19,7 @@ start offset and gradual drift.
 
 ## Recommended implementation
 
-### 1. Define a common timestamp model
+### 1. Define a common timestamp model (done)
 
 - Represent timestamps internally as a monotonic duration or integer
   microseconds.
@@ -28,7 +28,13 @@ start offset and gradual drift.
 - Make stream start an explicit synchronization event rather than treating
   each input's first packet as time zero.
 
-### 2. Add timestamp plumbing to the platform-neutral core
+Implemented in `crates/handycam-core/src/sync.rs` as `Synchronizer`. Each
+stream's first observed packet fixes its own offset from a shared `t = 0`;
+later packets are placed on the timeline using each stream's own precise
+internal clock (the unwrapped camera millisecond timestamp for video, the
+sample-frame count for audio), not per-packet host-clock jitter.
+
+### 2. Add timestamp plumbing to the platform-neutral core (done)
 
 - Extend frame/output events with presentation timestamps and durations.
 - Keep protocol decoding independent of ALSA, libusb, V4L2, or FFmpeg.
@@ -36,7 +42,16 @@ start offset and gradual drift.
   timeline, handles the 2048 ms camera-timestamp rollover, and reports gaps.
 - Test rollover, dropped frames, startup offset, and clock-rate differences.
 
-### 3. Capture timestamped audio
+`Synchronizer::push_video`/`push_audio` wrap the existing `CompressedFrame`
+and `AudioChunk` types (`VideoSyncFrame`/`AudioSyncChunk`) rather than
+modifying them, so `stream`/`replay`/`replay-capture` stay untouched and
+backward-compatible. `handycam-core` has no ALSA/libusb dependency and stays
+`forbid(unsafe_code)` and wasm-buildable. Rollover, dropped-frame gaps,
+startup-offset alignment, and injected audio-xrun discontinuities are covered
+by hardware-free unit tests in `sync.rs`; `AudioClock::resync` lets a real
+capture backend report lost samples explicitly instead of faking contiguity.
+
+### 3. Capture timestamped audio (not started)
 
 The Linux backend should read ALSA period timestamps when available and attach
 them to PCM blocks. If hardware timestamps are unavailable, use monotonic read
@@ -45,7 +60,13 @@ time plus the known 16 kHz sample count and mark that lower-accuracy mode.
 Audio blocks should carry a monotonic start timestamp, sample rate, channel
 count, complete sample count, and overrun/discontinuity information.
 
-### 4. Add a native muxing path
+This needs the `alsa` crate (a safe wrapper over `alsa-lib`), which in turn
+needs `libasound2-dev`/`pkgconf` present wherever the CLI is built, so it can
+link. Neither is installed in this sandbox; adding the dependency and the
+`handycam-alsa` crate is left for a follow-up with that build dependency
+available (and, for hardware-timestamp/xrun validation, real camera hardware).
+
+### 4. Add a native muxing path (muxer done; not yet wired to a capture command)
 
 Add an optional `capture` mode that owns both video and ALSA streams and writes
 a timestamped container, initially Matroska. Keep `stream --output -` for
@@ -58,6 +79,16 @@ and drift, and stop cleanly on SIGINT, camera removal, or audio loss.
 The first implementation can use an existing Rust container crate; the
 synchronization model should remain in the platform-neutral core for reuse by
 other backends.
+
+Implemented in the new `handycam-mkv` crate as `MatroskaWriter`: a minimal,
+dependency-free (aside from `thiserror`), `forbid(unsafe_code)` streaming
+EBML/Matroska writer covering exactly one MJPEG video track and one PCM audio
+track, using unknown-size `Segment`/`Cluster` elements so it only needs
+`Write`, not `Seek` -- no existing Rust crate both writes Matroska and stays
+pure-Rust, so this is hand-rolled rather than a dependency. There is
+deliberately no `Cues` element yet. It is unit-tested byte-for-byte against a
+synthetic fixture but not yet wired into a CLI `capture` command, since that
+also needs Phase 3's ALSA capture to have real audio to mux.
 
 ### 5. Retain an FFmpeg compatibility mode
 

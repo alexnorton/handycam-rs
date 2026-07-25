@@ -49,6 +49,13 @@ impl AudioClock {
         self.next_sample_frame
     }
 
+    /// Jump the timeline forward after a capture backend detects lost
+    /// samples (for example an ALSA xrun), instead of reporting the next
+    /// chunk as if it were contiguous with the last one.
+    pub fn resync(&mut self, new_next_sample_frame: u64) {
+        self.next_sample_frame = new_next_sample_frame;
+    }
+
     pub fn push_pcm(&mut self, pcm: &[u8]) -> Result<AudioChunk, AudioPacketError> {
         if pcm.len() % AUDIO_BYTES_PER_SAMPLE_FRAME != 0 {
             return Err(AudioPacketError::MisalignedLength(pcm.len()));
@@ -105,5 +112,15 @@ mod tests {
             AudioClock::new().push_pcm(&[0; 3]).unwrap_err(),
             AudioPacketError::MisalignedLength(3)
         );
+    }
+
+    #[test]
+    fn resync_jumps_the_timeline_past_lost_samples() {
+        let mut clock = AudioClock::new();
+        clock.push_pcm(&[0; AUDIO_BYTES_PER_USB_FRAME]).unwrap();
+        clock.resync(1_000);
+        let chunk = clock.push_pcm(&[0; AUDIO_BYTES_PER_USB_FRAME]).unwrap();
+        assert_eq!(chunk.start_sample_frame, 1_000);
+        assert_eq!(clock.next_sample_frame(), 1_016);
     }
 }

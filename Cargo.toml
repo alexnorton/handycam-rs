@@ -2,6 +2,7 @@
 members = [
     "crates/handycam-core",
     "crates/handycam-libusb",
+    "crates/handycam-mkv",
     "crates/handycam-cli",
 ]
 resolver = "3"

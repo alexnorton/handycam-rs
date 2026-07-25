@@ -1,0 +1,10 @@
+[package]
+name = "handycam-mkv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Minimal streaming Matroska writer for timestamped MJPEG video and PCM audio"
+
+[dependencies]
+thiserror.workspace = true
