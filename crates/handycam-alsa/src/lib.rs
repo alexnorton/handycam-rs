@@ -18,6 +18,7 @@ use alsa::pcm::{Access, Format, HwParams, PCM, TstampType};
 use alsa::{Direction, Error as AlsaError, ValueOr};
 use handycam_core::{
     AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, AudioChunk, AudioClock, AudioPacketError,
+    TimestampQuality,
 };
 use thiserror::Error;
 
@@ -25,14 +26,6 @@ use thiserror::Error;
 /// USB-frame-sized pieces internally; this just controls how many of those
 /// this backend batches into one read.
 const PERIOD_TIME_US: u32 = 20_000;
-
-/// Whether an audio chunk's timestamp came from an ALSA hardware capture
-/// timestamp or a monotonic host read-time estimate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimestampQuality {
-    Hardware,
-    MonotonicFallback,
-}
 
 /// One event produced by [`AlsaCapture::read`].
 #[derive(Debug)]

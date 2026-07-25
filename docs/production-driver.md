@@ -54,10 +54,29 @@ target/release/handycam stream --output - --semantic-init --quality 20 |
   ffmpeg -f mjpeg -framerate 25 -i - -c:v copy handycam.mkv
 ```
 
-### Capturing audio with the video pipe
+### Native synchronized capture
 
-The driver emits video on stdout; the camera's audio interfaces remain
-available to ALSA. Find the device with `arecord -l`, then mux both inputs:
+`capture` owns both the USB video session and an ALSA audio thread and writes
+one Matroska file with both tracks on a shared clock:
+
+```sh
+target/release/handycam capture \
+  --output handycam-record.mkv \
+  --alsa-device hw:1,0 \
+  --semantic-init --quality 20
+```
+
+Use `--playback-init` instead of `--semantic-init` for tape playback, and
+start transport from another terminal with `handycam transport play`. This
+is implemented and unit-tested but not yet validated against real camera and
+ALSA hardware; see [A/V synchronization next steps](next-steps-av-sync.md)
+for what that validation involves and its current status.
+
+### Capturing audio with the video pipe (FFmpeg fallback)
+
+The driver can also emit video on stdout alone, leaving the camera's audio
+interfaces available to ALSA directly. Find the device with `arecord -l`,
+then mux both inputs with FFmpeg:
 
 ```sh
 target/release/handycam stream --output - --semantic-init --quality 20 |
@@ -70,18 +89,15 @@ ffmpeg \
 
 For tape playback, use `--playback-init` instead of `--semantic-init` and
 start transport from another terminal with `handycam transport play`.
-The independent ALSA and camera clocks can produce a small offset; use
-FFmpeg's `-itsoffset` on the audio input when calibrating a recording.
-
-The planned native timestamped capture path is documented in
-[A/V synchronization next steps](next-steps-av-sync.md).
+Unlike `capture`, this pipeline's ALSA and camera clocks are independent and
+can produce a small offset; use FFmpeg's `-itsoffset` on the audio input when
+calibrating a recording, or prefer `capture` above.
 
 ### Calibrating a fixed audio offset
 
-Until the native `capture` path lands, the FFmpeg pipeline above has no
-shared clock between the video pipe and the ALSA input, so recordings can
-show a small, host-dependent fixed offset. Measure it once per host/device
-combination rather than guessing:
+The FFmpeg pipeline above has no shared clock between the video pipe and the
+ALSA input, so recordings can show a small, host-dependent fixed offset.
+Measure it once per host/device combination rather than guessing:
 
 1. Record a short clip containing a single sharp, visually and audibly
    distinct event — a clap, a bell, or a camera flash works well:
@@ -361,10 +377,17 @@ interface 0 returns to alt 0.
 The Cargo workspace separates:
 
 - `handycam-core`: a safe, platform-neutral state machine, initialization
-  representation, JPEG reconstruction, and YUYV conversion;
+  representation, JPEG reconstruction, YUYV conversion, and the
+  `Synchronizer` that anchors video and audio timestamps to one shared
+  presentation timeline;
 - `handycam-libusb`: the native USB transport and its narrowly contained
-  unsafe libusb transfer lifecycle; and
-- `handycam-cli`: Linux stdout and V4L2 sinks plus process supervision.
+  unsafe libusb transfer lifecycle;
+- `handycam-alsa`: timestamped ALSA audio capture, using hardware capture
+  timestamps when available and a monotonic-read-time estimate otherwise;
+- `handycam-mkv`: a minimal streaming EBML/Matroska writer for one MJPEG
+  video track and one PCM audio track; and
+- `handycam-cli`: Linux stdout/V4L2 sinks, the native `capture` muxing path,
+  and process supervision.
 
 The V4L2 sink uses one `write(2)` call per complete frame. This preserves the
 variable byte count of each MJPEG frame and avoids reusing a memory-mapped
@@ -381,5 +404,7 @@ experimental one-shot command while a persistent stateful control API remains
 future work.
 
 Native USB packet events also carry a host monotonic timestamp captured at
-libusb callback entry. This is the clock handoff needed by a future ALSA
-adapter; the current V4L2 and stdout video sinks do not yet consume it.
+libusb callback entry. This is the clock handoff the `capture` command's
+`Synchronizer` uses to correlate video against `handycam-alsa`'s own capture
+timestamps; the `stream` V4L2 and stdout sinks still don't need it and
+continue to ignore it.

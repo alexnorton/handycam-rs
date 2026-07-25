@@ -12,8 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+handycam-alsa = { path = "../handycam-alsa" }
 handycam-core = { path = "../handycam-core" }
 handycam-libusb = { path = "../handycam-libusb" }
+handycam-mkv = { path = "../handycam-mkv" }
 rusb.workspace = true
 signal-hook.workspace = true
 serde_json.workspace = true

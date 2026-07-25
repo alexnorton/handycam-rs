@@ -293,8 +293,10 @@ name = "handycam-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "handycam-alsa",
  "handycam-core",
  "handycam-libusb",
+ "handycam-mkv",
  "rusb",
  "serde_json",
  "signal-hook",

@@ -128,11 +128,31 @@ so ALSA can retain the audio interfaces:
 
 ```sh
 arecord -l
-arecord -D hw:1,0 -f S16_LE -r 16000 -c 2 capture.wav
 ```
 
-V4L2 and raw MJPEG stdout carry video only. To capture a multiplexed file in
-record mode, use the video pipe and ALSA as two FFmpeg inputs:
+The `capture` command records both to one synchronized Matroska file
+natively, with no external FFmpeg process and no independent per-input
+clocks:
+
+```sh
+target/release/handycam capture \
+  --output handycam-record.mkv \
+  --alsa-device hw:1,0 \
+  --semantic-init --quality 20
+```
+
+Use `--playback-init` instead of `--semantic-init` for tape playback, and
+start transport from another terminal as usual. See
+[A/V synchronization next steps](docs/next-steps-av-sync.md) for how this
+is implemented and what is still only validated by hardware-free tests.
+
+V4L2 and raw MJPEG stdout carry video only. The external-FFmpeg workflow
+below remains available -- for example to feed `ffplay` directly, or on a
+host where `capture`'s ALSA integration hasn't been validated yet -- but its
+two inputs do not share a clock, so calibration is needed; see "Calibrating
+a fixed audio offset" in the [production driver guide](docs/production-driver.md).
+To capture a multiplexed file this way, use the video pipe and ALSA as two
+FFmpeg inputs:
 
 ```sh
 target/release/handycam stream \
@@ -173,11 +193,11 @@ ffmpeg \
 ffplay -fflags nobuffer -f matroska -i -
 ```
 
-The audio and video clocks are currently independent, so a small fixed offset
-may be needed for a particular host. See "Calibrating a fixed audio offset"
-in the [production driver guide](docs/production-driver.md) for a measurement
-procedure, and [A/V synchronization next steps](docs/next-steps-av-sync.md)
-for the native fix in progress.
+This external pipeline's audio and video clocks are independent, so a small
+fixed offset may be needed for a particular host. See "Calibrating a fixed
+audio offset" in the [production driver guide](docs/production-driver.md) for
+a measurement procedure -- or use `capture` above, which does not have this
+problem.
 
 ## Documentation
 

@@ -2,20 +2,28 @@
 
 ## Current state
 
-The driver currently exposes video as an MJPEG or YUYV byte stream. Audio is
-left on the camera's standard ALSA interfaces and is muxed externally by
-FFmpeg. This is useful for experimentation, but the two streams do not yet
-share a production timestamp model.
+All five sections below are implemented in code and unit-tested; what
+remains is validation against a real DCR-HC24 and its ALSA interface, which
+this development sandbox does not have (no camera, no `/proc/asound`).
+
+The driver still exposes video as an MJPEG or YUYV byte stream via `stream`,
+unchanged, for FFmpeg compatibility. It now also has a native
+`handycam capture --output out.mkv --alsa-device hw:X,Y` path that owns both
+the USB video session and an ALSA audio capture thread, and writes a single
+timestamped Matroska file with both tracks sharing one clock -- no external
+FFmpeg process, no independent per-input clocks.
 
 The camera protocol provides a video timestamp in each stream header. In
 record mode it normally advances by 40 ms per frame (25 fps), and the core
 already unwraps the camera's 11-bit timestamp across rollover. At 16 kHz,
 640 stereo audio frames correspond to the same 40 ms interval.
 
-The current stdout path does not preserve the camera timestamp. FFmpeg
-generates video timestamps from the pipe's nominal frame rate while ALSA
-supplies audio timestamps from a separate clock. This can create both a fixed
-start offset and gradual drift.
+The old stdout path does not preserve the camera timestamp: FFmpeg generates
+video timestamps from the pipe's nominal frame rate while ALSA supplies audio
+timestamps from a separate clock, which can create both a fixed start offset
+and gradual drift. That path is retained as documented (with a calibration
+procedure) for consumers that specifically want the FFmpeg pipeline; `capture`
+is the fix for everyone else.
 
 ## Recommended implementation
 
@@ -80,7 +88,7 @@ itself -- hardware-timestamp availability, real xrun recovery, and actual
 device I/O -- still needs validation against the real DCR-HC24's ALSA
 interface.
 
-### 4. Add a native muxing path (muxer done; not yet wired to a capture command)
+### 4. Add a native muxing path (implemented; not yet hardware-validated)
 
 Add an optional `capture` mode that owns both video and ALSA streams and writes
 a timestamped container, initially Matroska. Keep `stream --output -` for
@@ -101,8 +109,18 @@ track, using unknown-size `Segment`/`Cluster` elements so it only needs
 `Write`, not `Seek` -- no existing Rust crate both writes Matroska and stays
 pure-Rust, so this is hand-rolled rather than a dependency. There is
 deliberately no `Cues` element yet. It is unit-tested byte-for-byte against a
-synthetic fixture but not yet wired into a CLI `capture` command, since that
-also needs Phase 3's ALSA capture to have real audio to mux.
+synthetic fixture and is now wired into a `handycam capture --output out.mkv
+--alsa-device hw:X,Y` command (`crates/handycam-cli/src/main.rs`): a
+`Synchronizer` and `MatroskaWriter` are driven from the thread polling the USB
+video session, draining the ALSA capture thread's channel each tick, sharing
+one `Instant` epoch so both `SessionEvent::Packet::received_at` and
+`AlsaCapture`'s `captured_at` land on the same `HostNanos` axis. `stream
+--output -` is untouched. End-to-end verified in this sandbox by running the
+real binary (no camera or ALSA device present): it opens the output file,
+writes a byte-correct EBML header/Tracks section (checked against the
+hand-decoded bytes), and exits cleanly with an error instead of hanging when
+the camera can't be opened. What remains is exactly the real-hardware
+measurement plan below.
 
 ### 5. Retain an FFmpeg compatibility mode
 
@@ -132,10 +150,11 @@ differences, but cannot discover the initial offset.
 
 ## Rough effort
 
-Timestamp/event plumbing and deterministic tests are small to medium work.
-ALSA timestamped capture is medium work. Native Matroska muxing, reconnect
-behavior, and hardware validation are medium to large work.
-
-The protocol reverse engineering is not the main remaining blocker. The work
-is primarily timestamp ownership, cross-clock measurement, and packaging the
-two existing streams into one correctly timed output.
+Timestamp/event plumbing, ALSA capture, native Matroska muxing, and the
+`capture` CLI wiring are all implemented and code-reviewed against
+hardware-free tests. What is left is entirely the real-hardware measurement
+and validation plan above: confirming hardware timestamps and xrun recovery
+against the camera's actual ALSA interface, and running the clap/flash
+alignment and drift measurements this document specifies. That is medium
+work, but it is measurement and possible bugfixing against real hardware, not
+new design or implementation.

@@ -1,7 +1,7 @@
 mod sink;
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -11,15 +11,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use handycam_alsa::{AlsaCapture, AlsaCaptureError, AudioCaptureEvent};
 use handycam_core::{
-    CompressedFrame, EndpointPacket, InitOp, OutputFormat, ScaleFactor, StreamDecoder,
-    TransportCommand, TransportCommandEncoder, override_record_mode_scale_factor, parse_init_plan,
-    record_mode_init_plan,
+    AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CompressedFrame, Discontinuity, EndpointPacket, HEIGHT,
+    HostNanos, InitOp, OutputFormat, ScaleFactor, StreamDecoder, Synchronizer, TimestampQuality,
+    TransportCommand, TransportCommandEncoder, WIDTH, override_record_mode_scale_factor,
+    parse_init_plan, record_mode_init_plan,
 };
 use handycam_libusb::{
     CameraSelector, InitStrategy, SessionEvent, UsbSession, UsbTransportError, read_camera_status,
     send_transport_command,
 };
+use handycam_mkv::{AudioTrackConfig, MatroskaWriter, MuxError, VideoTrackConfig};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use thiserror::Error;
 use tracing::{error, info, warn};
@@ -42,6 +45,8 @@ struct Cli {
 enum Command {
     /// Stream live camera video to V4L2 or stdout.
     Stream(StreamArgs),
+    /// Record synchronized video and ALSA audio to a native Matroska file.
+    Capture(CaptureArgs),
     /// Replay reconstructed JPEG frames through the production output sink.
     Replay(ReplayArgs),
     /// Replay an extracted endpoint capture through the protocol decoder.
@@ -136,6 +141,50 @@ struct StreamArgs {
     /// Output pixel/stream format.
     #[arg(long, value_enum, default_value_t)]
     format: FormatArg,
+
+    /// Select a physical USB path such as 001-2.3.
+    #[arg(long)]
+    usb_path: Option<CameraSelector>,
+
+    /// Override the embedded record-mode initialization plan.
+    #[arg(long)]
+    init_plan: Option<PathBuf>,
+
+    /// JPEG scale factor 4..=128; larger values produce lower quality.
+    #[arg(long)]
+    quality: Option<u8>,
+
+    /// Replace four captured startup read-runs with status-token polling.
+    #[arg(long, conflicts_with = "playback_init")]
+    semantic_init: bool,
+
+    /// Poll playback-mode n9 startup acknowledgements instead of literal reads.
+    #[arg(long, conflicts_with = "semantic_init")]
+    playback_init: bool,
+
+    /// Exit rather than waiting for or reconnecting the camera.
+    #[arg(long)]
+    no_reconnect: bool,
+
+    /// Diagnostic log representation; logs always go to stderr.
+    #[arg(long, value_enum, default_value_t)]
+    log_format: LogFormat,
+
+    /// Increase diagnostic verbosity.
+    #[arg(short, long, action = ArgAction::Count)]
+    verbose: u8,
+}
+
+#[derive(Parser, Debug)]
+struct CaptureArgs {
+    /// Output Matroska (.mkv) file path.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// ALSA capture device for the camera's USB Audio Class interface, such
+    /// as hw:1,0. Find it with `arecord -l`.
+    #[arg(long)]
+    alsa_device: String,
 
     /// Select a physical USB path such as 001-2.3.
     #[arg(long)]
@@ -269,6 +318,15 @@ enum AppError {
     SinkPanicked,
     #[error("transport sequence {0} is outside the four-bit range 0..=15")]
     InvalidTransportSequence(u8),
+    #[error("could not create capture output {path}: {source}")]
+    CreateOutput {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("ALSA audio capture failed: {0}")]
+    Alsa(#[from] AlsaCaptureError),
+    #[error("Matroska muxing failed: {0}")]
+    Mux(#[from] MuxError),
 }
 
 #[derive(Default)]
@@ -280,12 +338,19 @@ struct DriverStats {
     queue_drops: u64,
     protocol_errors: u64,
     reconnects: u64,
+    audio_chunks: u64,
+    audio_overruns: u64,
+    audio_fallback_timestamps: u64,
+    sync_discontinuities: u64,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match &cli.command {
         Command::Stream(arguments) => {
+            initialize_logging(arguments.log_format, arguments.verbose);
+        }
+        Command::Capture(arguments) => {
             initialize_logging(arguments.log_format, arguments.verbose);
         }
         Command::Replay(arguments) => {
@@ -300,6 +365,7 @@ fn main() -> ExitCode {
     }
     let result = match cli.command {
         Command::Stream(arguments) => run_stream(arguments),
+        Command::Capture(arguments) => run_capture(arguments),
         Command::Replay(arguments) => run_replay(arguments),
         Command::ReplayCapture(arguments) => run_replay_capture(arguments),
         Command::Transport(arguments) => run_transport(arguments),
@@ -406,6 +472,15 @@ fn initialize_logging(log_format: LogFormat, verbose: u8) {
     }
 }
 
+/// Registers SIGINT/SIGTERM handlers that flip a shared flag, the shutdown
+/// signal every long-running command polls for.
+fn install_signal_handlers() -> Result<Arc<AtomicBool>, AppError> {
+    let stopping = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGINT, Arc::clone(&stopping))?;
+    signal_hook::flag::register(SIGTERM, Arc::clone(&stopping))?;
+    Ok(stopping)
+}
+
 fn run_replay(arguments: ReplayArgs) -> Result<(), AppError> {
     let jpeg_frames = load_replay_frames(&arguments.input)?;
     let output_format = OutputFormat::from(arguments.format);
@@ -414,9 +489,7 @@ fn run_replay(arguments: ReplayArgs) -> Result<(), AppError> {
     } else {
         SinkTarget::V4l2(PathBuf::from(&arguments.output))
     };
-    let stopping = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(SIGINT, Arc::clone(&stopping))?;
-    signal_hook::flag::register(SIGTERM, Arc::clone(&stopping))?;
+    let stopping = install_signal_handlers()?;
 
     let (frame_sender, frame_receiver) = mpsc::sync_channel(1);
     let (sink_status_sender, sink_status_receiver) = mpsc::channel();
@@ -688,9 +761,7 @@ fn run_stream(arguments: StreamArgs) -> Result<(), AppError> {
         SinkTarget::V4l2(PathBuf::from(&arguments.output))
     };
 
-    let stopping = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(SIGINT, Arc::clone(&stopping))?;
-    signal_hook::flag::register(SIGTERM, Arc::clone(&stopping))?;
+    let stopping = install_signal_handlers()?;
 
     let (frame_sender, frame_receiver) = mpsc::sync_channel(1);
     let (sink_status_sender, sink_status_receiver) = mpsc::channel();
@@ -707,21 +778,18 @@ fn run_stream(arguments: StreamArgs) -> Result<(), AppError> {
             break result;
         }
 
-        info!(selector = %selector, "opening camera");
-        let mut session = match UsbSession::open_with_init_strategy(&selector, &plan, init_strategy)
-        {
-            Ok(session) => session,
-            Err(error) if should_retry_open(&error) && !arguments.no_reconnect => {
-                warn!(%error, retry_ms = retry_delay.as_millis(), "camera unavailable");
-                if wait_interruptibly(retry_delay, &stopping, &sink_status_receiver)? {
-                    break Ok(());
-                }
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
-                continue;
-            }
-            Err(error) => break Err(error.into()),
+        let mut session = match open_camera_with_backoff(
+            &selector,
+            &plan,
+            init_strategy,
+            arguments.no_reconnect,
+            &mut retry_delay,
+            &stopping,
+            Some(&sink_status_receiver),
+        )? {
+            OpenOutcome::Opened(session) => session,
+            OpenOutcome::GaveUp => break Ok(()),
         };
-        retry_delay = Duration::from_millis(500);
         stats.reconnects += 1;
         info!(
             bus = session.bus(),
@@ -766,8 +834,89 @@ enum SessionEnd {
     Disconnected(String),
 }
 
+enum OpenOutcome {
+    Opened(UsbSession),
+    GaveUp,
+}
+
+/// Opens the camera, retrying with exponential backoff on a transient
+/// "camera unavailable" error until it succeeds, a fatal error occurs, or
+/// the caller should give up (shutdown requested, sink closed, or
+/// `no_reconnect` set). Shared by `run_stream` and `run_capture` so both
+/// reconnect the same way.
+fn open_camera_with_backoff(
+    selector: &CameraSelector,
+    plan: &[InitOp],
+    init_strategy: InitStrategy,
+    no_reconnect: bool,
+    retry_delay: &mut Duration,
+    stopping: &AtomicBool,
+    sink_status: Option<&mpsc::Receiver<SinkStatus>>,
+) -> Result<OpenOutcome, AppError> {
+    loop {
+        info!(selector = %selector, "opening camera");
+        match UsbSession::open_with_init_strategy(selector, plan, init_strategy) {
+            Ok(session) => {
+                *retry_delay = Duration::from_millis(500);
+                return Ok(OpenOutcome::Opened(session));
+            }
+            Err(error) if should_retry_open(&error) && !no_reconnect => {
+                warn!(%error, retry_ms = retry_delay.as_millis(), "camera unavailable");
+                if wait_interruptibly(*retry_delay, stopping, sink_status)? {
+                    return Ok(OpenOutcome::GaveUp);
+                }
+                *retry_delay = (*retry_delay * 2).min(Duration::from_secs(5));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 fn is_nominal_camera_delta(delta_ms: u16) -> bool {
     (39..=41).contains(&delta_ms)
+}
+
+/// Feeds one endpoint packet through the protocol decoder, updating packet
+/// and timestamp-gap statistics, and returns a completed frame if this
+/// packet finished one. Shared by the `stream` and `capture` session loops.
+fn decode_video_packet(
+    decoder: &mut StreamDecoder,
+    endpoint: handycam_core::Endpoint,
+    data: &[u8],
+    stats: &mut DriverStats,
+) -> Option<CompressedFrame> {
+    match endpoint {
+        handycam_core::Endpoint::Boundary => {
+            if data.first().is_some_and(|byte| byte & 0x08 != 0) {
+                stats.boundaries += 1;
+            }
+        }
+        handycam_core::Endpoint::Video => {
+            if data.len() >= 8 && data[..6] == [0xff; 6] {
+                stats.headers += 1;
+            }
+        }
+    }
+    match decoder.push_packet(EndpointPacket { endpoint, data }) {
+        Ok(Some(frame)) => {
+            if !is_nominal_camera_delta(frame.timestamp_delta_to_next_ms) {
+                stats.timestamp_gaps += 1;
+                warn!(
+                    sequence = frame.sequence,
+                    delta_ms = frame.timestamp_delta_to_next_ms,
+                    "camera timestamp gap"
+                );
+            }
+            Some(frame)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            stats.protocol_errors += 1;
+            warn!(%error, "discarding malformed camera record");
+            decoder.reset();
+            None
+        }
+    }
 }
 
 fn run_session(
@@ -801,46 +950,15 @@ fn run_session(
         for event in events {
             match event {
                 SessionEvent::Packet { endpoint, data, .. } => {
-                    match endpoint {
-                        handycam_core::Endpoint::Boundary => {
-                            if data.first().is_some_and(|byte| byte & 0x08 != 0) {
-                                stats.boundaries += 1;
+                    if let Some(frame) = decode_video_packet(decoder, endpoint, &data, stats) {
+                        match frames.try_send(frame) {
+                            Ok(()) => stats.frames += 1,
+                            Err(TrySendError::Full(_)) => {
+                                stats.queue_drops += 1;
                             }
-                        }
-                        handycam_core::Endpoint::Video => {
-                            if data.len() >= 8 && data[..6] == [0xff; 6] {
-                                stats.headers += 1;
+                            Err(TrySendError::Disconnected(_)) => {
+                                return Ok(SessionEnd::SinkClosed);
                             }
-                        }
-                    }
-                    match decoder.push_packet(EndpointPacket {
-                        endpoint,
-                        data: &data,
-                    }) {
-                        Ok(Some(frame)) => {
-                            if !is_nominal_camera_delta(frame.timestamp_delta_to_next_ms) {
-                                stats.timestamp_gaps += 1;
-                                warn!(
-                                    sequence = frame.sequence,
-                                    delta_ms = frame.timestamp_delta_to_next_ms,
-                                    "camera timestamp gap"
-                                );
-                            }
-                            match frames.try_send(frame) {
-                                Ok(()) => stats.frames += 1,
-                                Err(TrySendError::Full(_)) => {
-                                    stats.queue_drops += 1;
-                                }
-                                Err(TrySendError::Disconnected(_)) => {
-                                    return Ok(SessionEnd::SinkClosed);
-                                }
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            stats.protocol_errors += 1;
-                            warn!(%error, "discarding malformed camera record");
-                            decoder.reset();
                         }
                     }
                 }
@@ -872,6 +990,275 @@ fn run_session(
             next_report = Instant::now() + Duration::from_secs(10);
         }
     }
+}
+
+/// Records synchronized video and ALSA audio to a native Matroska file.
+///
+/// Unlike `stream`, there is no separate sink thread: this thread itself
+/// owns the `Synchronizer` and `MatroskaWriter` and drains both the USB
+/// video session and the audio capture thread's channel directly.
+fn run_capture(arguments: CaptureArgs) -> Result<(), AppError> {
+    let mut plan = load_plan(arguments.init_plan.as_ref())?;
+    if let Some(value) = arguments.quality {
+        let scale_factor = ScaleFactor::new(value)?;
+        if !override_record_mode_scale_factor(&mut plan, scale_factor) {
+            return Err(AppError::MissingScaleFactorWrite);
+        }
+        info!(quality = value, "overrode JPEG scale factor");
+    }
+    let init_strategy = if arguments.semantic_init {
+        InitStrategy::ConditionPolling
+    } else if arguments.playback_init {
+        InitStrategy::PlaybackConditionPolling
+    } else {
+        InitStrategy::LiteralReplay
+    };
+    let selector = arguments.usb_path.unwrap_or_default();
+
+    let stopping = install_signal_handlers()?;
+
+    let output_file =
+        fs::File::create(&arguments.output).map_err(|source| AppError::CreateOutput {
+            path: arguments.output.clone(),
+            source,
+        })?;
+    let mut muxer = MatroskaWriter::create(
+        BufWriter::new(output_file),
+        VideoTrackConfig {
+            width: WIDTH,
+            height: HEIGHT,
+        },
+        AudioTrackConfig {
+            sample_rate: AUDIO_SAMPLE_RATE_HZ,
+            channels: AUDIO_CHANNELS,
+            bit_depth: 16,
+        },
+    )?;
+
+    // The origin every video `received_at` and audio `captured_at` Instant
+    // is converted relative to, so both land on the same HostNanos axis fed
+    // into the Synchronizer.
+    let capture_epoch = Instant::now();
+    let (audio_sender, audio_receiver) = mpsc::channel();
+    let audio_device = arguments.alsa_device.clone();
+    let audio_stopping = Arc::clone(&stopping);
+    let audio_thread = thread::Builder::new()
+        .name("handycam-audio".to_owned())
+        .spawn(move || run_audio_capture(&audio_device, &audio_stopping, audio_sender))
+        .expect("could not spawn audio capture thread");
+
+    let mut stats = DriverStats::default();
+    let mut synchronizer = Synchronizer::new();
+    let mut retry_delay = Duration::from_millis(500);
+    let result = loop {
+        if stopping.load(Ordering::Relaxed) {
+            break Ok(());
+        }
+
+        let mut session = match open_camera_with_backoff(
+            &selector,
+            &plan,
+            init_strategy,
+            arguments.no_reconnect,
+            &mut retry_delay,
+            &stopping,
+            None,
+        )? {
+            OpenOutcome::Opened(session) => session,
+            OpenOutcome::GaveUp => break Ok(()),
+        };
+        stats.reconnects += 1;
+        info!(
+            bus = session.bus(),
+            address = session.address(),
+            ports = ?session.port_path(),
+            "camera initialized"
+        );
+
+        let mut decoder = StreamDecoder::new();
+        let mut sink = CaptureSink {
+            synchronizer: &mut synchronizer,
+            muxer: &mut muxer,
+            capture_epoch,
+        };
+        let session_result = run_capture_session(
+            &mut session,
+            &mut decoder,
+            &mut sink,
+            &audio_receiver,
+            &stopping,
+            &mut stats,
+        );
+        session.stop();
+        match session_result {
+            Ok(SessionEnd::Stopped | SessionEnd::SinkClosed) => break Ok(()),
+            Ok(SessionEnd::Disconnected(reason)) => {
+                warn!(%reason, "camera session ended");
+                if arguments.no_reconnect {
+                    break Err(AppError::Sink(format!("camera disconnected: {reason}")));
+                }
+            }
+            Err(error) => break Err(error),
+        }
+    };
+
+    // Stop the audio thread even if the video loop above already broke on
+    // its own signal-driven shutdown, so `join` below cannot block forever.
+    stopping.store(true, Ordering::Relaxed);
+    match audio_thread.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, "audio capture stopped"),
+        Err(_) => warn!("audio capture thread panicked"),
+    }
+    muxer.finish()?;
+    result
+}
+
+fn run_audio_capture(
+    device: &str,
+    stopping: &AtomicBool,
+    events: mpsc::Sender<AudioCaptureEvent>,
+) -> Result<(), AlsaCaptureError> {
+    let mut capture = AlsaCapture::open(device)?;
+    while !stopping.load(Ordering::Relaxed) {
+        if let Some(event) = capture.read(Duration::from_millis(200))? {
+            if events.send(event).is_err() {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bundles the muxing-side state a capture session thread owns, so it can be
+/// threaded through as one argument instead of three.
+struct CaptureSink<'a, W: Write> {
+    synchronizer: &'a mut Synchronizer,
+    muxer: &'a mut MatroskaWriter<W>,
+    capture_epoch: Instant,
+}
+
+fn run_capture_session(
+    session: &mut UsbSession,
+    decoder: &mut StreamDecoder,
+    sink: &mut CaptureSink<impl Write>,
+    audio_events: &mpsc::Receiver<AudioCaptureEvent>,
+    stopping: &AtomicBool,
+    stats: &mut DriverStats,
+) -> Result<SessionEnd, AppError> {
+    let mut next_report = Instant::now() + Duration::from_secs(10);
+    loop {
+        if stopping.load(Ordering::Relaxed) {
+            return Ok(SessionEnd::Stopped);
+        }
+        drain_audio_events(audio_events, sink, stats)?;
+
+        let events = match session.poll(Duration::from_millis(100)) {
+            Ok(events) => events,
+            Err(error) => {
+                if stopping.load(Ordering::Relaxed) {
+                    return Ok(SessionEnd::Stopped);
+                }
+                return Ok(SessionEnd::Disconnected(error.to_string()));
+            }
+        };
+        for event in events {
+            match event {
+                SessionEvent::Packet {
+                    endpoint,
+                    data,
+                    received_at,
+                } => {
+                    if let Some(frame) = decode_video_packet(decoder, endpoint, &data, stats) {
+                        let synced = sink
+                            .synchronizer
+                            .push_video(frame, host_nanos_since(sink.capture_epoch, received_at));
+                        report_discontinuity(synced.discontinuity, stats);
+                        sink.muxer
+                            .write_video_frame(synced.pts_ns, &synced.frame.jpeg)?;
+                        stats.frames += 1;
+                    }
+                }
+                SessionEvent::PacketError { endpoint, status } => {
+                    warn!(?endpoint, status, "isochronous packet error");
+                    decoder.reset();
+                }
+                event if event.ends_session() => {
+                    return Ok(SessionEnd::Disconnected(format!("{event:?}")));
+                }
+                _ => {}
+            }
+        }
+        if Instant::now() >= next_report {
+            log_capture_stats(session, stats);
+            next_report = Instant::now() + Duration::from_secs(10);
+        }
+    }
+}
+
+fn drain_audio_events(
+    audio_events: &mpsc::Receiver<AudioCaptureEvent>,
+    sink: &mut CaptureSink<impl Write>,
+    stats: &mut DriverStats,
+) -> Result<(), AppError> {
+    while let Ok(event) = audio_events.try_recv() {
+        match event {
+            AudioCaptureEvent::Chunk {
+                chunk,
+                captured_at,
+                quality,
+            } => {
+                if matches!(quality, TimestampQuality::MonotonicFallback) {
+                    stats.audio_fallback_timestamps += 1;
+                }
+                let synced = sink.synchronizer.push_audio(
+                    chunk,
+                    host_nanos_since(sink.capture_epoch, captured_at),
+                    quality,
+                );
+                report_discontinuity(synced.discontinuity, stats);
+                sink.muxer
+                    .write_audio_chunk(synced.pts_ns, &synced.chunk.pcm)?;
+                stats.audio_chunks += 1;
+            }
+            AudioCaptureEvent::Overrun { frames_lost } => {
+                stats.audio_overruns += 1;
+                warn!(frames_lost, "ALSA audio overrun recovered");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn report_discontinuity(discontinuity: Option<Discontinuity>, stats: &mut DriverStats) {
+    if let Some(discontinuity) = discontinuity {
+        stats.sync_discontinuities += 1;
+        warn!(?discontinuity, "audio/video sync discontinuity");
+    }
+}
+
+fn log_capture_stats(session: &UsbSession, stats: &DriverStats) {
+    let usb = session.stats();
+    info!(
+        usb_packets = usb.packets,
+        usb_nonempty = usb.nonempty_packets,
+        usb_packet_errors = usb.packet_errors,
+        usb_bytes = usb.bytes,
+        boundaries = stats.boundaries,
+        headers = stats.headers,
+        frames = stats.frames,
+        timestamp_gaps = stats.timestamp_gaps,
+        protocol_errors = stats.protocol_errors,
+        audio_chunks = stats.audio_chunks,
+        audio_overruns = stats.audio_overruns,
+        audio_fallback_timestamps = stats.audio_fallback_timestamps,
+        sync_discontinuities = stats.sync_discontinuities,
+        "capture statistics"
+    );
+}
+
+fn host_nanos_since(epoch: Instant, at: Instant) -> HostNanos {
+    HostNanos(at.saturating_duration_since(epoch).as_nanos() as u64)
 }
 
 fn load_plan(path: Option<&PathBuf>) -> Result<Vec<InitOp>, AppError> {
@@ -918,14 +1305,16 @@ fn should_retry_open(error: &UsbTransportError) -> bool {
 fn wait_interruptibly(
     duration: Duration,
     stopping: &AtomicBool,
-    sink_status: &mpsc::Receiver<SinkStatus>,
+    sink_status: Option<&mpsc::Receiver<SinkStatus>>,
 ) -> Result<bool, AppError> {
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
         if stopping.load(Ordering::Relaxed) {
             return Ok(true);
         }
-        if let Some(result) = check_sink(sink_status) {
+        if let Some(status) = sink_status
+            && let Some(result) = check_sink(status)
+        {
             result?;
             return Ok(true);
         }
