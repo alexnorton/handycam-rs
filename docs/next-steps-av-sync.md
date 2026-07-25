@@ -51,7 +51,7 @@ startup-offset alignment, and injected audio-xrun discontinuities are covered
 by hardware-free unit tests in `sync.rs`; `AudioClock::resync` lets a real
 capture backend report lost samples explicitly instead of faking contiguity.
 
-### 3. Capture timestamped audio (not started)
+### 3. Capture timestamped audio (implemented; not yet hardware-validated)
 
 The Linux backend should read ALSA period timestamps when available and attach
 them to PCM blocks. If hardware timestamps are unavailable, use monotonic read
@@ -60,11 +60,25 @@ time plus the known 16 kHz sample count and mark that lower-accuracy mode.
 Audio blocks should carry a monotonic start timestamp, sample rate, channel
 count, complete sample count, and overrun/discontinuity information.
 
-This needs the `alsa` crate (a safe wrapper over `alsa-lib`), which in turn
-needs `libasound2-dev`/`pkgconf` present wherever the CLI is built, so it can
-link. Neither is installed in this sandbox; adding the dependency and the
-`handycam-alsa` crate is left for a follow-up with that build dependency
-available (and, for hardware-timestamp/xrun validation, real camera hardware).
+Implemented in the new `handycam-alsa` crate as `AlsaCapture`, using the
+`alsa` crate (a safe wrapper over `alsa-lib`; `cpal` was considered but
+deliberately hides the hardware-timestamp and explicit xrun-recovery APIs
+this needs to stay cross-platform). It enables ALSA's `SND_PCM_TSTAMP_TYPE_MONOTONIC`
+hardware timestamps when the driver supports them and falls back to a
+monotonic read-time estimate otherwise, reporting which one was used via
+`TimestampQuality`. An xrun (`EPIPE` on read) is recovered via
+`PCM::recover`, and the lost sample-frame span is estimated from elapsed
+wall-clock time and applied via the new `AudioClock::resync` from Phase 1,
+surfaced to the caller as `AudioCaptureEvent::Overrun`.
+
+This needed the `alsa` crate, which in turn needs `libasound2-dev`/`pkgconf`
+present wherever the CLI is built, so it can link; both are now installed in
+this environment. There is no ALSA device at all in this sandbox (no
+`/proc/asound`), so only the hardware-free parts (`clock` module: timestamp
+conversion, lost-frame estimation) have automated tests here. `AlsaCapture`
+itself -- hardware-timestamp availability, real xrun recovery, and actual
+device I/O -- still needs validation against the real DCR-HC24's ALSA
+interface.
 
 ### 4. Add a native muxing path (muxer done; not yet wired to a capture command)
 

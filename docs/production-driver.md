@@ -8,7 +8,9 @@ camera. It does not use the Windows VM or Sony driver.
 
 Install a stable Rust toolchain, `libusb-1.0` development files, Clang, and
 the V4L2 headers. The optional V4L2 path also needs `v4l2loopback`; stdout
-does not.
+does not. The `handycam-alsa` crate links against `libasound2-dev` (via
+`pkg-config`); this is required to build the workspace at all, even before a
+`capture` command exists to use it.
 
 ```sh
 . "$HOME/.cargo/env"
