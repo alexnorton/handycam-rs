@@ -127,15 +127,60 @@ ALSA USB device. The userspace video driver claims only vendor interface 0,
 so ALSA can retain the audio interfaces:
 
 ```sh
+arecord -l
 arecord -D hw:1,0 -f S16_LE -r 16000 -c 2 capture.wav
 ```
 
-V4L2 and raw MJPEG stdout carry video only. Use an explicit FFmpeg container
-pipeline when synchronized A/V is required.
+V4L2 and raw MJPEG stdout carry video only. To capture a multiplexed file in
+record mode, use the video pipe and ALSA as two FFmpeg inputs:
+
+```sh
+target/release/handycam stream \
+  --output - --semantic-init --quality 20 |
+ffmpeg \
+  -thread_queue_size 512 -f mjpeg -framerate 25 -i pipe:0 \
+  -thread_queue_size 512 -f alsa -ar 16000 -ac 2 -i hw:1,0 \
+  -map 0:v:0 -map 1:a:0 -c:v copy -c:a pcm_s16le \
+  -af aresample=async=1 handycam-record.mkv
+```
+
+For tape playback, replace `--semantic-init` with `--playback-init` and start
+transport separately when needed:
+
+```sh
+target/release/handycam stream \
+  --output - --playback-init --quality 20 |
+ffmpeg \
+  -thread_queue_size 512 -f mjpeg -framerate 25 -i pipe:0 \
+  -thread_queue_size 512 -f alsa -ar 16000 -ac 2 -i hw:1,0 \
+  -map 0:v:0 -map 1:a:0 -c:v copy -c:a pcm_s16le \
+  -af aresample=async=1 handycam-playback.mkv
+
+target/release/handycam transport play
+```
+
+For a live preview while recording, add a second FFmpeg output with the tee
+muxer and pipe it to `ffplay`:
+
+```sh
+target/release/handycam stream --output - --semantic-init --quality 20 |
+ffmpeg \
+  -thread_queue_size 512 -f mjpeg -framerate 25 -i pipe:0 \
+  -thread_queue_size 512 -f alsa -ar 16000 -ac 2 -i hw:1,0 \
+  -map 0:v:0 -map 1:a:0 -c:v copy -c:a pcm_s16le \
+  -af aresample=async=1 -f tee \
+  "[f=matroska]handycam.mkv|[f=matroska]pipe:1" |
+ffplay -fflags nobuffer -f matroska -i -
+```
+
+The audio and video clocks are currently independent, so a small fixed offset
+may be needed for a particular host; see the production driver guide for
+details.
 
 ## Documentation
 
 - [Production driver guide](docs/production-driver.md)
+- [A/V synchronization next steps](docs/next-steps-av-sync.md)
 - [Protocol and reverse-engineering record](reverse-engineering/PROTOCOL.md)
 - [Reverse-engineering evidence and experiments](reverse-engineering/)
 

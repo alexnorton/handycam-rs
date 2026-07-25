@@ -52,6 +52,28 @@ target/release/handycam stream --output - --semantic-init --quality 20 |
   ffmpeg -f mjpeg -framerate 25 -i - -c:v copy handycam.mkv
 ```
 
+### Capturing audio with the video pipe
+
+The driver emits video on stdout; the camera's audio interfaces remain
+available to ALSA. Find the device with `arecord -l`, then mux both inputs:
+
+```sh
+target/release/handycam stream --output - --semantic-init --quality 20 |
+ffmpeg \
+  -thread_queue_size 512 -f mjpeg -framerate 25 -i pipe:0 \
+  -thread_queue_size 512 -f alsa -ar 16000 -ac 2 -i hw:1,0 \
+  -map 0:v:0 -map 1:a:0 -c:v copy -c:a pcm_s16le \
+  -af aresample=async=1 handycam-record.mkv
+```
+
+For tape playback, use `--playback-init` instead of `--semantic-init` and
+start transport from another terminal with `handycam transport play`.
+The independent ALSA and camera clocks can produce a small offset; use
+FFmpeg's `-itsoffset` on the audio input when calibrating a recording.
+
+The planned native timestamped capture path is documented in
+[A/V synchronization next steps](next-steps-av-sync.md).
+
 For applications that need uncompressed frames:
 
 ```sh
