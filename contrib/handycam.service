@@ -1,0 +1,25 @@
+[Unit]
+Description=Sony DCR-HC24 userspace video driver
+After=dev-video10.device
+Wants=dev-video10.device
+
+[Service]
+Type=simple
+User=handycam
+SupplementaryGroups=video
+ExecStart=/usr/local/bin/handycam stream --output /dev/video10 --format mjpeg
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

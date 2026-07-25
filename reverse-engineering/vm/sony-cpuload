@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+usage() {
+  echo "Usage: $0 {status|set-64|set-128}" >&2
+  exit 2
+}
+
+action="${1:-}"
+case "${action}" in
+  status)
+    exec "${script_dir}/winxp-ssh" \
+      'r="HKLM\\SOFTWARE\\SONY PVC\\Sony Digital Imaging"; for k in Rel1 Rel2 Rel3; do echo "== $k =="; reg query "$r\\$k" /v CPULoad; done'
+    ;;
+  set-64)
+    exec "${script_dir}/winxp-ssh" \
+      'r="HKLM\\SOFTWARE\\SONY PVC\\Sony Digital Imaging"; for k in Rel1 Rel2 Rel3; do reg add "$r\\$k" /v CPULoad /t REG_DWORD /d 64 /f || exit; done'
+    ;;
+  set-128)
+    exec "${script_dir}/winxp-ssh" \
+      'r="HKLM\\SOFTWARE\\SONY PVC\\Sony Digital Imaging"; for k in Rel1 Rel2 Rel3; do reg add "$r\\$k" /v CPULoad /t REG_DWORD /d 128 /f || exit; done'
+    ;;
+  *)
+    usage
+    ;;
+esac

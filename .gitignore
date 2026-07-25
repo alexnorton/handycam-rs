@@ -1,0 +1,23 @@
+# Rust build output
+target/
+
+# Large reverse-engineering captures and extracted binaries
+reverse-engineering/captures/
+reverse-engineering/artifacts/
+
+# Local research/VM state
+reverse-engineering/vm/*.png
+reverse-engineering/vm/keys/
+
+# Python tooling caches and local environments
+__pycache__/
+*.pyc
+.venv/
+
+# Credentials and downloaded legacy installers (if recreated locally)
+keys/
+cygwin-repo/
+cygwin-pubring.*
+setup-x86*.exe*
+setup.xz
+cygwin-setup.iso

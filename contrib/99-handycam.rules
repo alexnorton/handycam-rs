@@ -1,0 +1,4 @@
+# Permit the active local user and members of the video group to open the
+# Sony DCR-HC24 composite device. Interface 0 is claimed by libusb;
+# snd-usb-audio keeps interfaces 1 and 2.
+SUBSYSTEM=="usb", ATTR{idVendor}=="054c", ATTR{idProduct}=="00c0", GROUP="video", MODE="0660", TAG+="uaccess"

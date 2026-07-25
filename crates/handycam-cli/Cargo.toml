@@ -1,0 +1,22 @@
+[package]
+name = "handycam-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Linux userspace driver for Sony Handycam USB video"
+
+[[bin]]
+name = "handycam"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+handycam-core = { path = "../handycam-core" }
+handycam-libusb = { path = "../handycam-libusb" }
+rusb.workspace = true
+signal-hook.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+v4l.workspace = true

@@ -1,0 +1,8 @@
+<hostdev mode="subsystem" type="usb" managed="yes">
+  <source>
+    <vendor id="0x054c"/>
+    <product id="0x00c0"/>
+  </source>
+  <alias name="ua-camera"/>
+  <address type="usb" bus="1" port="1"/>
+</hostdev>

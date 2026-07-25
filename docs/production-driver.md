@@ -1,0 +1,311 @@
+# Production userspace driver
+
+The Rust implementation captures live record-mode video directly from a Sony
+DCR-HC24 and emits either an MJPEG stream, raw YUYV frames, or a V4L2 virtual
+camera. It does not use the Windows VM or Sony driver.
+
+## Build
+
+Install a stable Rust toolchain, `libusb-1.0` development files, Clang, and
+the V4L2 headers. The optional V4L2 path also needs `v4l2loopback`; stdout
+does not.
+
+```sh
+. "$HOME/.cargo/env"
+make rust
+```
+
+The binary is `target/release/handycam`. The complete automated check is:
+
+```sh
+make rust-check
+```
+
+Install only the unprivileged executable with:
+
+```sh
+sudo make install
+```
+
+`PREFIX` and `DESTDIR` follow their conventional Make meanings, so package
+staging can use, for example, `make install DESTDIR=/tmp/handycam-package`.
+Kernel-module, udev, and service configuration remains explicitly opt-in
+under `contrib/`.
+
+## Stdout
+
+MJPEG is the default and preserves the camera's compressed stream after
+adding standard JPEG headers and byte stuffing:
+
+```sh
+target/release/handycam stream \
+  --output - \
+  --semantic-init \
+  --quality 20 |
+  ffplay -f mjpeg -framerate 25 -
+```
+
+To write a file through FFmpeg:
+
+```sh
+target/release/handycam stream --output - --semantic-init --quality 20 |
+  ffmpeg -f mjpeg -framerate 25 -i - -c:v copy handycam.mkv
+```
+
+For applications that need uncompressed frames:
+
+```sh
+target/release/handycam stream \
+  --output - \
+  --format yuyv \
+  --semantic-init \
+  --quality 20 |
+  ffmpeg \
+    -f rawvideo \
+    -pixel_format yuyv422 \
+    -video_size 320x240 \
+    -framerate 25 \
+    -i - \
+    handycam.mkv
+```
+
+Stdout contains frame bytes only. Logs always go to stderr. Closing a
+downstream pipe stops the camera cleanly.
+
+## Tape playback and transport
+
+In playback mode, use the playback-specific startup acknowledgement:
+
+```sh
+target/release/handycam stream \
+  --output - \
+  --playback-init \
+  --quality 20 |
+ffplay -f mjpeg -framerate 25 -i -
+```
+
+The recovered controls can inspect status or send one sequenced operation:
+
+```sh
+target/release/handycam transport status
+target/release/handycam transport play
+target/release/handycam transport pause
+target/release/handycam transport stop
+```
+
+Fast-forward and Rewind are available as `fast-forward` and `rewind`. The
+current interface is explicitly experimental. By default it derives the
+current sequence from the high nibble of status byte 0, increments it, and
+wraps after 15. `--current-sequence` remains available for exact protocol
+experiments. The command reports the exact word, status before/after, and
+every changed status byte. It waits 500 ms by default so the physical state
+in byte 2 has time to settle; override that only for protocol timing
+experiments.
+
+Transport transitions can yield a single MJPEG entropy-concealment warning in
+FFmpeg even when USB framing remains intact. Pillow decoded every frame in
+the repeated validation runs, so consumers should tolerate a recoverable
+tape-transition frame.
+
+Record-mode `--semantic-init` waits for `n1` startup acknowledgements.
+Playback-mode `--playback-init` waits for the observed `n9` acknowledgements.
+Literal initialization remains available by omitting both flags.
+
+## V4L2 virtual camera
+
+The driver deliberately does not run privileged commands or manage kernel
+modules. On Ubuntu, install the loopback packages:
+
+```sh
+sudo apt install v4l2loopback-dkms v4l2loopback-utils v4l-utils
+sudo modprobe v4l2loopback \
+  video_nr=10 \
+  card_label="Sony DCR-HC24" \
+  exclusive_caps=1
+```
+
+Then run:
+
+```sh
+target/release/handycam stream \
+  --output /dev/video10 \
+  --semantic-init \
+  --quality 20
+```
+
+If `modprobe` reports `Key was rejected by service`, Secure Boot has rejected
+the DKMS module's signing certificate. Check whether the certificate that
+signed the module is already enrolled:
+
+```sh
+modinfo -F signer v4l2loopback
+sudo mokutil --test-key /var/lib/shim-signed/mok/MOK.der
+```
+
+On Ubuntu, enroll the existing DKMS Machine Owner Key with:
+
+```sh
+sudo mokutil --import /var/lib/shim-signed/mok/MOK.der
+```
+
+Choose a temporary enrollment password when prompted, reboot, and select
+**Enroll MOK**, **Continue**, and **Yes** in the blue MOK Manager screen.
+Enter the temporary password and reboot once more. Then verify and load the
+module:
+
+```sh
+mokutil --test-key /var/lib/shim-signed/mok/MOK.der
+sudo modprobe v4l2loopback \
+  video_nr=10 \
+  card_label="Sony DCR-HC24" \
+  exclusive_caps=1
+```
+
+Use `--format yuyv` if a consumer does not accept MJPEG. Confirm the device
+with:
+
+```sh
+v4l2-ctl --device /dev/video10 --all
+ffplay -f v4l2 -framerate 25 -video_size 320x240 /dev/video10
+```
+
+With `exclusive_caps=1`, start the Handycam producer first. The loopback node
+advertises capture capability only after the producer supplies its first
+frame; a consumer opened earlier reports `Not a video capture device`.
+
+## Recorded-frame replay
+
+The replay command drives the production stdout or V4L2 sink from one
+reconstructed JPEG or a filename-sorted directory of JPEGs. It runs at the
+camera's 25 fps cadence and is useful for testing consumers without the
+camera:
+
+```sh
+target/release/handycam replay \
+  --input reverse-engineering/captures/frames-linux-init-first-v2 \
+  --output /dev/video10 \
+  --loop
+```
+
+Add `--format yuyv` to test the uncompressed sink. Interrupt a looping replay
+with Ctrl-C. Replay bypasses USB and Sony framing, so it validates output
+integration but does not replace the live-camera acceptance test.
+
+For a stronger no-camera regression, replay a boundary-preserving endpoint
+extraction through the production Sony decoder:
+
+```sh
+target/release/handycam replay-capture \
+  --input reverse-engineering/captures/live-linux-init-first \
+  --output - > /tmp/replayed.mjpg
+```
+
+This reads `iso-packets.jsonl`, `ep81.bin`, and `ep82.bin`; it exercises
+cross-endpoint framing, JPEG reconstruction, and the selected output sink.
+The reference capture produces 123 frames with no protocol errors.
+
+The files under `contrib/` are opt-in examples for persistent module
+configuration, USB permissions, and a system service. Review paths, user,
+group, and video node before copying them into `/etc`.
+
+## Optional persistent service
+
+After reviewing the example files and completing any Secure Boot enrollment,
+a conventional system installation is:
+
+```sh
+sudo make install
+sudo useradd \
+  --system \
+  --no-create-home \
+  --home-dir /nonexistent \
+  --shell /usr/sbin/nologin \
+  --groups video \
+  handycam
+sudo install -Dm644 contrib/99-handycam.rules \
+  /etc/udev/rules.d/99-handycam.rules
+sudo install -Dm644 contrib/v4l2loopback.conf \
+  /etc/modprobe.d/handycam-v4l2loopback.conf
+sudo install -Dm644 contrib/v4l2loopback.modules-load.conf \
+  /etc/modules-load.d/handycam-v4l2loopback.conf
+sudo install -Dm644 contrib/handycam.service \
+  /etc/systemd/system/handycam.service
+sudo udevadm control --reload
+sudo systemctl daemon-reload
+sudo systemctl enable --now handycam.service
+```
+
+If the `handycam` account already exists, inspect its group membership rather
+than rerunning `useradd`. Replug the camera after installing the udev rule.
+The service waits for an absent camera and reconnects automatically.
+
+## Device permissions
+
+For a one-connection test, grant an ACL to the camera's current USB node as
+shown in the main README. For persistent use, install a reviewed version of
+`contrib/99-handycam.rules`, add the service user to the `video` group, and
+reload udev rules.
+
+The process claims only vendor interface 0. Linux continues to expose the
+camera's standard audio interfaces through `snd-usb-audio`.
+
+`--semantic-init` replaces four fixed-length startup status-read runs with
+real acknowledgement polling. It is live-validated and reduces initialization
+from roughly 2.66 seconds to about 1.05 seconds on this camera. Omit it to
+retain exact literal replay as a diagnostic fallback.
+
+`--quality` selects the startup JPEG scale factor from 4 through 128. Larger
+values produce smaller, lower-quality frames. Values 4, 20, 40, 80, and 128
+have all passed live capture and decode tests. Runtime quality switching is
+not yet exposed.
+
+## Runtime behavior
+
+The program waits when the camera is absent and automatically reinitializes
+it after reconnection. Use `--no-reconnect` for one-shot operation.
+
+If more than one matching camera is attached, select its physical USB path:
+
+```sh
+target/release/handycam stream \
+  --usb-path 001-2.3 \
+  --output /dev/video10
+```
+
+The path uses the USB bus followed by the stable port chain, not the
+short-lived USB device address.
+
+Diagnostics include USB packet counts, frame boundaries, record headers,
+timestamp gaps, dropped output frames, and protocol errors. Increase detail
+with `-v`, or select structured stderr logs with `--log-format json`.
+
+On shutdown, every asynchronous transfer is cancelled and reaped before
+interface 0 returns to alt 0.
+
+## Architecture
+
+The Cargo workspace separates:
+
+- `handycam-core`: a safe, platform-neutral state machine, initialization
+  representation, JPEG reconstruction, and YUYV conversion;
+- `handycam-libusb`: the native USB transport and its narrowly contained
+  unsafe libusb transfer lifecycle; and
+- `handycam-cli`: Linux stdout and V4L2 sinks plus process supervision.
+
+The V4L2 sink uses one `write(2)` call per complete frame. This preserves the
+variable byte count of each MJPEG frame and avoids reusing a memory-mapped
+output buffer before a loopback consumer has finished with it.
+
+`handycam-core` builds for `wasm32-unknown-unknown`. A future WebUSB backend
+can provide individual endpoint packets to the same `StreamDecoder`.
+
+The platform-neutral core contains a typed, tested encoder for Play, Pause,
+Stop, Fast-forward, and Rewind recovered from Sony's original application.
+All five operations, status transitions, repeated commands, and sequence
+wraparound are live-validated. The Linux CLI exposes them through an
+experimental one-shot command while a persistent stateful control API remains
+future work.
+
+Native USB packet events also carry a host monotonic timestamp captured at
+libusb callback entry. This is the clock handoff needed by a future ALSA
+adapter; the current V4L2 and stdout video sinks do not yet consume it.

@@ -1,0 +1,12 @@
+[package]
+name = "handycam-libusb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Native libusb transport for Sony Handycam video"
+
+[dependencies]
+handycam-core = { path = "../handycam-core" }
+rusb.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

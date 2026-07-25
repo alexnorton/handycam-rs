@@ -1,0 +1,16 @@
+[package]
+name = "handycam-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Platform-neutral Sony Handycam USB video protocol core"
+
+[dependencies]
+hex.workspace = true
+hex-literal.workspace = true
+jpeg-decoder.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+sha2.workspace = true

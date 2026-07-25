@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+readonly vm_name="winxp"
+readonly vm_mac="52:54:00:2f:3b:e1"
+
+if [[ "$#" -ne 2 ]]; then
+  echo "Usage: $0 GUEST_PATH LOCAL_PATH" >&2
+  exit 2
+fi
+
+guest_address="$(
+  virsh domifaddr "${vm_name}" --source lease |
+    awk -v mac="${vm_mac}" '$2 == mac && $3 == "ipv4" {
+      split($4, address, "/")
+      print address[1]
+      exit
+    }'
+)"
+
+if [[ -z "${guest_address}" ]]; then
+  echo "Could not discover ${vm_name}'s IPv4 lease for ${vm_mac}." >&2
+  exit 1
+fi
+
+printf -v guest_path_quoted '%q' "$1"
+
+exec scp \
+  -i "${script_dir}/keys/winxp_rsa" \
+  -o BatchMode=yes \
+  -o IdentitiesOnly=yes \
+  -o StrictHostKeyChecking=accept-new \
+  -o UserKnownHostsFile="${script_dir}/keys/known_hosts" \
+  -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+  -o HostkeyAlgorithms=+ssh-rsa \
+  "Alex@${guest_address}:${guest_path_quoted}" \
+  "$2"
