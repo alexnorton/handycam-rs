@@ -3,6 +3,7 @@ name = "handycam-libusb"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "Native libusb transport for Sony Handycam video"
 
 [dependencies]

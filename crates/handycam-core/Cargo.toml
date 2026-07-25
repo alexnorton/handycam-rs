@@ -3,6 +3,7 @@ name = "handycam-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 description = "Platform-neutral Sony Handycam USB video protocol core"
 
 [dependencies]
