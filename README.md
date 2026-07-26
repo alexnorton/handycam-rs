@@ -203,6 +203,7 @@ problem.
 
 - [Production driver guide](docs/production-driver.md)
 - [A/V synchronization next steps](docs/next-steps-av-sync.md)
+- [Browser-based monitoring next steps](docs/next-steps-webusb-monitoring.md)
 - [Protocol and reverse-engineering record](reverse-engineering/PROTOCOL.md)
 - [Reverse-engineering evidence and experiments](reverse-engineering/)
 
