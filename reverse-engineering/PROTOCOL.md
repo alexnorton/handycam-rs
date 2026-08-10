@@ -40,6 +40,36 @@ The exact meaning of most Sony register indices is not yet known. The current
 implementation replays a known-good initialization sequence rather than
 claiming semantic knowledge of every register.
 
+## Compatibility evidence
+
+The recovered `sonypvs2.inf` has a single model entry. It binds
+`sonypvs1.sys` to `USB\VID_054C&PID_00C0&MI_00`, the vendor video interface,
+without naming a retail camera. The same INF installs three parameter sets
+labelled “Model1 (without SDRAM),” “Model2 (with SDRAM),” and “Model3 (new
+chip).” This indicates that Sony intended one driver and USB identity to cover
+multiple hardware variants, although the file does not map those variants to
+camera model numbers.
+
+Independent owner reports associate that exact interface ID with:
+
+| Reported model | Evidence |
+| --- | --- |
+| DCR-HC21 | [`lsusb` report](https://www.linuxquestions.org/questions/linux-software-2/capture-video-from-sony-dv-video-camera-570056/) |
+| DCR-HC23/HC23E | [Windows hardware-ID report](https://www.helpmij.nl/forum/threads/sony-dcr-hc23-driver.583137/) |
+| DCR-HC37 | [Windows hardware-ID report](https://forum.softpedia.com/topic/589718-unde-gasesc-driver-pentru-sony-handycam-dcr-hc37-pentru-windows-7/) |
+| DCR-HC40E | [Windows hardware-ID report](https://ddriver.ru/kms_forumd%2Btopic%2Bforum-12%2Bids-656.html) |
+| DCR-HC90 | [`lsusb -v` report](https://www.hwupgrade.it/forum/showthread.php?t=1728064) |
+| DCR-PC330E | [Windows hardware-ID report](https://notebookclub.org/forum/thread-516-page-74.html) |
+| DCR-TRV250 | [`lsusb` report](https://askubuntu.com/questions/1485200/how-can-i-capture-sony-handycam-output-via-usb) |
+| DCR-TRV461E | [Windows hardware-ID report](https://forums.commentcamarche.net/forum/affich-31056352-driver-sony-handycam-dcr-trv461e) |
+
+These are community observations, not Sony compatibility declarations. They
+show that the cameras reach the same USB driver-selection boundary; they do
+not prove that descriptors, initialization registers, JPEG framing, audio
+format, or transport controls are identical. The production implementation
+has only been validated on the DCR-HC24 and currently accepts only
+`054c:00c0`.
+
 ## USB layout
 
 The device has one configuration and three interfaces.

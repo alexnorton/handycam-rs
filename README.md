@@ -1,7 +1,7 @@
 # Sony DCR-HC24 userspace driver
 
-This project provides a Rust userspace driver for the Sony DCR-HC24 Handycam.
-It captures the camera's vendor USB video stream and exposes it as:
+This project provides a Rust userspace driver tested with the Sony DCR-HC24
+Handycam. It captures the camera's vendor USB video stream and exposes it as:
 
 - clean MJPEG or YUYV frames on stdout;
 - a v4l2loopback device on Linux;
@@ -11,6 +11,28 @@ It captures the camera's vendor USB video stream and exposes it as:
 The platform-neutral protocol and synchronization core is separate from the
 native libusb, ALSA, Matroska, and Linux output adapters. The core builds for
 `wasm32-unknown-unknown`; only the Linux platform adapters are implemented.
+
+## Camera compatibility and capture quality
+
+Only the DCR-HC24 has been tested. Sony's recovered Windows XP driver binds to
+the USB Streaming interface ID `054c:00c0`, rather than to a retail model name,
+and contains three internal hardware profiles. Community hardware reports show
+the same ID on cameras including the DCR-HC21, DCR-HC23/HC23E, DCR-HC37,
+DCR-HC40E, DCR-HC90, DCR-PC330E, DCR-TRV250, and DCR-TRV461E. This is evidence
+that the protocol was shared, but it is not a compatibility guarantee: this
+driver currently replays an initialization sequence captured from a DCR-HC24,
+and another hardware profile may require different register values.
+
+If an untested camera reports `054c:00c0` in USB Streaming mode, a short
+`handycam stream` run is a reasonable compatibility test. Please report the
+exact model, USB descriptors, and result. The evidence behind the candidate
+list is recorded in the [protocol documentation](reverse-engineering/PROTOCOL.md#compatibility-evidence).
+
+For transferring MiniDV tape, prefer the camera's i.LINK/IEEE 1394 (FireWire)
+connection whenever possible. FireWire carries the native DV stream and gives
+substantially better archival quality than this camera's 320×240 USB Streaming
+video. This driver is useful when FireWire is unavailable and for webcam-style
+live capture.
 
 ## Build and test
 
