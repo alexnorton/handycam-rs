@@ -1,0 +1,11 @@
+[package]
+name = "handycam-matroska"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Platform-neutral timestamped Matroska writer for Handycam capture"
+
+[dependencies]
+handycam-core = { path = "../handycam-core" }
+thiserror.workspace = true

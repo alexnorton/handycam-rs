@@ -14,6 +14,8 @@ path = "src/main.rs"
 clap.workspace = true
 handycam-core = { path = "../handycam-core" }
 handycam-libusb = { path = "../handycam-libusb" }
+handycam-linux-audio = { path = "../handycam-linux-audio" }
+handycam-matroska = { path = "../handycam-matroska" }
 rusb.workspace = true
 signal-hook.workspace = true
 serde_json.workspace = true

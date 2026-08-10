@@ -4,17 +4,18 @@ This project provides a Rust userspace driver for the Sony DCR-HC24 Handycam.
 It captures the camera's vendor USB video stream and exposes it as:
 
 - clean MJPEG or YUYV frames on stdout;
-- a v4l2loopback device on Linux; and
-- experimental tape-playback transport controls.
+- a v4l2loopback device on Linux;
+- synchronized MJPEG/PCM capture in a Matroska container; and
+- tape-playback transport controls for the five primary operations.
 
-The platform-neutral protocol core is separate from the native libusb backend
-and Linux sinks. The core builds for `wasm32-unknown-unknown`, leaving room
-for WebUSB, macOS, or Windows backends later.
+The platform-neutral protocol and synchronization core is separate from the
+native libusb, ALSA, Matroska, and Linux output adapters. The core builds for
+`wasm32-unknown-unknown`; only the Linux platform adapters are implemented.
 
 ## Build and test
 
-Install Rust, `libusb-1.0` development files, V4L2 headers, and (for the
-virtual-camera path) v4l2loopback:
+Install Rust, `libusb-1.0` and ALSA development files, V4L2 headers, and (for
+the virtual-camera path) v4l2loopback:
 
 ```sh
 make rust
@@ -116,9 +117,9 @@ target/release/handycam transport rewind
 ```
 
 The command derives the next four-bit sequence from the status mailbox. Use
-`--current-sequence` when reproducing an exact protocol trace. The transport
-interface remains experimental while secondary shuttle commands and metadata
-are investigated.
+`--current-sequence` when reproducing an exact protocol trace. Play, Pause,
+Stop, Fast-forward, and Rewind are live-validated. Sony's secondary shuttle
+commands and tape metadata are not decoded or exposed.
 
 ## Audio and synchronized A/V
 
@@ -131,8 +132,41 @@ arecord -l
 arecord -D hw:1,0 -f S16_LE -r 16000 -c 2 capture.wav
 ```
 
+The native capture path preserves the observed startup offset and writes
+camera-derived video PTS plus sample-clock-derived audio PTS:
+
+```sh
+target/release/handycam capture \
+  --output handycam-synced.mkv \
+  --audio-device hw:1,0 \
+  --audio-delay-ms 60 \
+  --semantic-init \
+  --quality 20
+```
+
+The output path must not already exist. Direct ALSA capture is the default and
+derives each period's first-sample time from the monotonic PCM status timestamp,
+captured-frame availability, and sample count. Use `--audio-backend arecord`
+to select the lower-accuracy process fallback when direct ALSA is unavailable.
+The direct backend requires ALSA development files when building from source.
+`--audio-delay-ms` shifts audio only in the Matroska timeline: positive values
+delay audio and negative values advance it. Repeated clap tests with the
+DCR-HC24 validated `--audio-delay-ms 60` subjectively and frame by frame. The
+default remains `0`, because fixed capture latency may differ by camera model,
+mode, USB controller, and backend.
+
+This is a fixed-latency calibration, not clock-drift correction. ALSA can place
+audio samples close to their hardware capture time, while a visible frame must
+pass through sensor exposure/readout, camera-side JPEG encoding and buffering,
+USB packetization, and host-side frame assembly. The Sony decoder also cannot
+emit a completed JPEG until the following record header arrives. Those stages
+can make the image content appear later than the corresponding sound even when
+both clocks advance at exactly the correct rate. Delaying audio by 60 ms aligns
+presentation without changing either media clock or the reported drift.
+
 V4L2 and raw MJPEG stdout carry video only. To capture a multiplexed file in
-record mode, use the video pipe and ALSA as two FFmpeg inputs:
+record mode through the compatibility path, use the video pipe and ALSA as two
+FFmpeg inputs:
 
 ```sh
 target/release/handycam stream \
@@ -173,14 +207,14 @@ ffmpeg \
 ffplay -fflags nobuffer -f matroska -i -
 ```
 
-The audio and video clocks are currently independent, so a small fixed offset
-may be needed for a particular host; see the production driver guide for
-details.
+The external FFmpeg path still treats the audio and video clocks independently,
+so a small fixed offset may be needed for a particular host; see the production
+driver guide for details.
 
 ## Documentation
 
 - [Production driver guide](docs/production-driver.md)
-- [A/V synchronization next steps](docs/next-steps-av-sync.md)
+- [A/V synchronization design and validation](docs/av-sync.md)
 - [Protocol and reverse-engineering record](reverse-engineering/PROTOCOL.md)
 - [Reverse-engineering evidence and experiments](reverse-engineering/)
 

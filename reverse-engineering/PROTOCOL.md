@@ -1,6 +1,6 @@
 # Sony DCR-HC24 USB video protocol
 
-Status: experimentally implemented for live camera/record mode and playback transport  
+Status: implemented and live-validated for record capture and primary playback transport
 Device tested: Sony DCR-HC24  
 USB identity: `054c:00c0`  
 USB speed: full speed, 12 Mbit/s
@@ -705,13 +705,14 @@ fully semantic implementation:
 - identify the upper five flag bits in record-header byte 6;
 - determine whether alternate settings map to explicit quality or bandwidth
   modes;
-- validate USB-frame/monotonic A/V synchronization over a long live run;
+- bound monotonic A/V drift with a 30-minute live capture;
 - decode playback bytes 6–7 against a displayed playhead/timecode;
 - search playback DV payload/subcode and control requests for clip capture
   date/time metadata;
-- identify the upper five record-header flag bits and status byte 9;
+- identify status byte 9;
 - identify the secondary `0x23`, `0x30`, and `0x31` shuttle/state commands;
 - test other cameras sharing USB ID `054c:00c0`; and
-- validate reconnects and longer streams.
+- fault-test capture reconnects and longer streams.
 
-None of those unknowns prevents record-mode video capture and decoding.
+None of those unknowns prevents record-mode video capture, synchronized
+Matroska recording, or the five primary playback transport operations.

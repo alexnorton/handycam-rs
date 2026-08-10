@@ -1,6 +1,12 @@
 # Rust build output
 target/
 
+# Local capture outputs created by README and validation commands
+/*.mkv
+/*.mp4
+/*.mjpg
+/*.wav
+
 # Large reverse-engineering captures and extracted binaries
 reverse-engineering/captures/
 reverse-engineering/artifacts/

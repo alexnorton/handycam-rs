@@ -10,7 +10,9 @@ mod audio;
 mod control;
 mod init;
 mod jpeg;
+mod media;
 mod stream;
+mod sync;
 
 pub use audio::{
     AUDIO_BYTES_PER_SAMPLE, AUDIO_BYTES_PER_SAMPLE_FRAME, AUDIO_BYTES_PER_USB_FRAME,
@@ -28,7 +30,12 @@ pub use init::{
     record_mode_init_plan,
 };
 pub use jpeg::{FrameConversionError, OutputFormat, jpeg_to_yuyv, reconstruct_jpeg};
+pub use media::{
+    AudioFormat, AudioFormatError, MonotonicTimestamp, PcmEncoding, TimedAudioChunk,
+    TimedMediaEvent, TimedMediaSink, TimedVideoFrame, TimestampAccuracy,
+};
 pub use stream::{CompressedFrame, Endpoint, EndpointPacket, StreamDecodeError, StreamDecoder};
+pub use sync::{AvSynchronizer, MediaTiming, SynchronizationError};
 
 /// Sony's USB vendor ID.
 pub const VENDOR_ID: u16 = 0x054c;

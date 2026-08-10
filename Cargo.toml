@@ -2,6 +2,8 @@
 members = [
     "crates/handycam-core",
     "crates/handycam-libusb",
+    "crates/handycam-linux-audio",
+    "crates/handycam-matroska",
     "crates/handycam-cli",
 ]
 resolver = "3"
@@ -13,6 +15,7 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
+alsa = "0.12.1"
 clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
 hex-literal = "1.0"

@@ -1,0 +1,13 @@
+[package]
+name = "handycam-linux-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Direct ALSA and arecord fallback audio adapters for Handycam capture"
+
+[dependencies]
+alsa.workspace = true
+handycam-core = { path = "../handycam-core" }
+libc.workspace = true
+thiserror.workspace = true

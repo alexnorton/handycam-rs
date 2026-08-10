@@ -1,8 +1,8 @@
-# Protocol research roadmap
+# Protocol research status
 
-This is the working plan for replacing opaque initialization replay and
-adding transport, quality, and synchronized audio. The known-good
-`record-mode-init.tsv` remains the regression oracle throughout.
+This records which reverse-engineering goals are implemented and which
+protocol questions remain open. The known-good `record-mode-init.tsv` remains
+the regression oracle for initialization changes.
 
 ## 1. Semantic initialization
 
@@ -31,8 +31,8 @@ replaying 57 captured reads. One run acknowledged tokens `0x71`, `0x81`,
 approximately 2.66 seconds to 1.07 seconds, and repeated quality runs plus a
 32-second soak remained clean.
 
-Next, replace one additional phase at a time in the Rust transport with
-generated semantic operations. Each replacement must be checked against:
+Further initialization reduction should replace one additional phase at a
+time with generated semantic operations. Validate each replacement against:
 
 - the exact request bytes;
 - the original ordering and required delays;
@@ -125,7 +125,7 @@ A normal 40-ms video interval therefore spans exactly 640 stereo sample
 frames or 2,560 bytes. `handycam-core` now contains the format constants,
 an `AudioClock`, and this conversion as tested platform-neutral primitives.
 
-The synchronization authority should be:
+The implemented synchronization authority is:
 
 1. scheduled USB-frame number when the backend supplies it;
 2. monotonic capture timestamp plus counted audio samples otherwise;
@@ -135,43 +135,43 @@ The synchronization authority should be:
 This ordering matters because the existing OHCI trace contains a seven-second
 run of distinct, decodable video records with a frozen Sony timestamp.
 
-For the first Linux implementation, use a separate `AudioSource` adapter so
-video interface 0 can remain under libusb while `snd-usb-audio` owns
-interfaces 1 and 2. ALSA timestamps and the counted 16-kHz clock can align to
-the monotonic video clock. A later direct-libusb audio backend may claim
-interface 2 to retain exact scheduled USB-frame numbers, at the cost of
-exclusive ownership.
+The Linux implementation uses a separate audio adapter, so video interface 0
+remains under libusb while `snd-usb-audio` owns interfaces 1 and 2. Direct ALSA
+capture maps monotonic PCM status timestamps and the counted 16-kHz sample
+clock onto the video clock. An `arecord` fallback provides explicitly marked
+estimated timestamps.
 
-Raw MJPEG stdout cannot carry synchronized audio. Preserve the existing
-media-clean video stdout mode and add either:
+Raw MJPEG stdout and V4L2 carry video only. The `capture` command writes
+timestamped MJPEG and PCM16LE directly to Matroska; applications can also
+consume the physical ALSA node alongside the video-only outputs.
 
-- a separate raw-PCM audio output; or
-- an explicit container mode such as Matroska for combined A/V.
-
-V4L2 carries video only. Linux applications can consume the physical ALSA
-capture node directly at first; an ALSA loopback sink is a separate optional
-integration.
-
-Concurrent hardware integration is now verified: FFmpeg recorded 126 live
+Concurrent hardware integration was first verified when FFmpeg recorded 126 live
 MJPEG frames plus stereo 16-kHz PCM into a 5.039-second Matroska file. Both
 streams began at the same FFmpeg-normalized origin and the audio contained
-real signal. This establishes simultaneous ownership and basic integration,
-but not yet long-run phase-error bounds.
+real signal. That established simultaneous ownership and basic integration,
+but did not establish long-run phase-error bounds.
 
 A 20-second follow-up produced exactly 500 video frames and 320,013 extracted
 stereo audio sample frames (about 20.0008 seconds). The sub-millisecond
-difference is encouraging but includes container cutoff rounding; precise
-phase and drift still require same-process monotonic timestamp correlation.
+difference was encouraging but included container cutoff rounding. The
+same-process correlation described below superseded that early measurement.
 
-`build_sony_av.py` now proves the offline clock model. It rebuilt a
+`build_sony_av.py` proves the offline clock model. It rebuilt a
 9.040-second Matroska file containing 192 distinct 320x240 MJPEG frames and
 16-kHz stereo PCM, anchored on the same unwrapped USB frame. Per-frame USB
 PTS preserves capture gaps and remains synchronized despite 155 frozen Sony
-timestamp intervals. The native libusb transport now stamps every endpoint
-packet with host monotonic time at callback entry. The next hardware step is
-to retain those times through frame reconstruction and correlate them with
-ALSA capture timestamps. A backend that can expose scheduled USB-frame
-numbers can later provide a still stronger clock.
+timestamp intervals. The native libusb transport stamps every endpoint packet
+with host monotonic time at callback entry, retains those observations through
+frame reconstruction, and correlates them with ALSA capture timestamps in the
+platform-neutral synchronizer.
+
+Real-device direct-ALSA capture produced 297 video frames and 297 audio periods
+over 11.892 seconds with zero timestamp gaps and a complete FFmpeg decode. At
+ten seconds, maximum observed media-clock deviation was 249 us for video and
+185 us for audio. Clap tests found a fixed content offset and validated a
+60 ms audio delay for this DCR-HC24; see the production
+[A/V synchronization document](../../docs/av-sync.md). A 30-minute drift run,
+tape-playback calibration, and forced hardware discontinuity tests remain.
 
 ## Offline commands
 

@@ -1,7 +1,7 @@
 mod sink;
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -12,14 +12,17 @@ use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use handycam_core::{
-    CompressedFrame, EndpointPacket, InitOp, OutputFormat, ScaleFactor, StreamDecoder,
-    TransportCommand, TransportCommandEncoder, override_record_mode_scale_factor, parse_init_plan,
-    record_mode_init_plan,
+    AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, AudioFormat, AvSynchronizer, CompressedFrame,
+    EndpointPacket, InitOp, MonotonicTimestamp, OutputFormat, ScaleFactor, StreamDecoder,
+    TimedMediaEvent, TimedVideoFrame, TransportCommand, TransportCommandEncoder,
+    override_record_mode_scale_factor, parse_init_plan, record_mode_init_plan,
 };
 use handycam_libusb::{
     CameraSelector, InitStrategy, SessionEvent, UsbSession, UsbTransportError, read_camera_status,
     send_transport_command,
 };
+use handycam_linux_audio::{AlsaCapture, ArecordCapture, AudioCaptureError, AudioCaptureEvent};
+use handycam_matroska::{MatroskaError, MatroskaWriter};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use thiserror::Error;
 use tracing::{error, info, warn};
@@ -42,12 +45,68 @@ struct Cli {
 enum Command {
     /// Stream live camera video to V4L2 or stdout.
     Stream(StreamArgs),
+    /// Capture synchronized MJPEG video and PCM audio to Matroska.
+    Capture(CaptureArgs),
     /// Replay reconstructed JPEG frames through the production output sink.
     Replay(ReplayArgs),
     /// Replay an extracted endpoint capture through the protocol decoder.
     ReplayCapture(ReplayCaptureArgs),
     /// Experimentally inspect status or send one playback transport command.
     Transport(TransportArgs),
+}
+
+#[derive(Parser, Debug)]
+struct CaptureArgs {
+    /// Matroska output file.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// ALSA PCM device, such as hw:1,0.
+    #[arg(long)]
+    audio_device: String,
+
+    /// Linux audio adapter; direct ALSA provides hardware timestamps.
+    #[arg(long, value_enum, default_value_t)]
+    audio_backend: AudioBackendArg,
+
+    /// Shift audio PTS at muxing time; positive values delay audio.
+    #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+    audio_delay_ms: i64,
+
+    /// Select a physical USB path such as 001-2.3.
+    #[arg(long)]
+    usb_path: Option<CameraSelector>,
+
+    /// Override the embedded record-mode initialization plan.
+    #[arg(long)]
+    init_plan: Option<PathBuf>,
+
+    /// JPEG scale factor 4..=128; larger values produce lower quality.
+    #[arg(long)]
+    quality: Option<u8>,
+
+    /// Replace four captured startup read-runs with status-token polling.
+    #[arg(long, conflicts_with = "playback_init")]
+    semantic_init: bool,
+
+    /// Poll playback-mode n9 startup acknowledgements instead of literal reads.
+    #[arg(long, conflicts_with = "semantic_init")]
+    playback_init: bool,
+
+    /// Diagnostic log representation; logs always go to stderr.
+    #[arg(long, value_enum, default_value_t)]
+    log_format: LogFormat,
+
+    /// Increase diagnostic verbosity.
+    #[arg(short, long, action = ArgAction::Count)]
+    verbose: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum AudioBackendArg {
+    #[default]
+    Alsa,
+    Arecord,
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -267,6 +326,23 @@ enum AppError {
     Protocol(#[from] handycam_core::StreamDecodeError),
     #[error("output worker panicked")]
     SinkPanicked,
+    #[error("audio capture failed: {0}")]
+    Audio(#[from] AudioCaptureError),
+    #[error("Matroska capture failed: {0}")]
+    Matroska(#[from] MatroskaError),
+    #[error("could not create capture output {path}: {source}")]
+    CreateCapture {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("audio capture ended unexpectedly")]
+    AudioClosed,
+    #[error("audio capture failed: {0}")]
+    AudioWorker(String),
+    #[error("capture stopped without receiving any audio periods")]
+    NoCapturedAudio,
+    #[error("capture stopped without receiving any video frames")]
+    NoCapturedVideo,
     #[error("transport sequence {0} is outside the four-bit range 0..=15")]
     InvalidTransportSequence(u8),
 }
@@ -288,6 +364,9 @@ fn main() -> ExitCode {
         Command::Stream(arguments) => {
             initialize_logging(arguments.log_format, arguments.verbose);
         }
+        Command::Capture(arguments) => {
+            initialize_logging(arguments.log_format, arguments.verbose);
+        }
         Command::Replay(arguments) => {
             initialize_logging(arguments.log_format, arguments.verbose);
         }
@@ -300,6 +379,7 @@ fn main() -> ExitCode {
     }
     let result = match cli.command {
         Command::Stream(arguments) => run_stream(arguments),
+        Command::Capture(arguments) => run_capture(arguments),
         Command::Replay(arguments) => run_replay(arguments),
         Command::ReplayCapture(arguments) => run_replay_capture(arguments),
         Command::Transport(arguments) => run_transport(arguments),
@@ -664,6 +744,255 @@ fn run_replay_capture(arguments: ReplayCaptureArgs) -> Result<(), AppError> {
     Ok(())
 }
 
+enum RunningAudioCapture {
+    Alsa(AlsaCapture),
+    Arecord(ArecordCapture),
+}
+
+impl RunningAudioCapture {
+    fn stop(self) -> Result<(), AudioCaptureError> {
+        match self {
+            Self::Alsa(capture) => capture.stop(),
+            Self::Arecord(capture) => capture.stop(),
+        }
+    }
+}
+
+fn run_capture(arguments: CaptureArgs) -> Result<(), AppError> {
+    let mut plan = load_plan(arguments.init_plan.as_ref())?;
+    if let Some(value) = arguments.quality {
+        let scale_factor = ScaleFactor::new(value)?;
+        if !override_record_mode_scale_factor(&mut plan, scale_factor) {
+            return Err(AppError::MissingScaleFactorWrite);
+        }
+    }
+    let init_strategy = if arguments.semantic_init {
+        InitStrategy::ConditionPolling
+    } else if arguments.playback_init {
+        InitStrategy::PlaybackConditionPolling
+    } else {
+        InitStrategy::LiteralReplay
+    };
+    let selector = arguments.usb_path.unwrap_or_default();
+    let stopping = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGINT, Arc::clone(&stopping))?;
+    signal_hook::flag::register(SIGTERM, Arc::clone(&stopping))?;
+
+    info!(selector = %selector, "opening camera for synchronized capture");
+    let mut session = UsbSession::open_with_init_strategy(&selector, &plan, init_strategy)?;
+    let session_origin = Instant::now();
+    let (audio_capture, audio_events, timestamp_accuracy) = match arguments.audio_backend {
+        AudioBackendArg::Alsa => {
+            let (capture, events) = AlsaCapture::spawn(&arguments.audio_device, session_origin)?;
+            (RunningAudioCapture::Alsa(capture), events, "alsa-monotonic")
+        }
+        AudioBackendArg::Arecord => {
+            let (capture, events) = ArecordCapture::spawn(&arguments.audio_device, session_origin)?;
+            (RunningAudioCapture::Arecord(capture), events, "estimated")
+        }
+    };
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&arguments.output)
+        .map_err(|source| AppError::CreateCapture {
+            path: arguments.output.clone(),
+            source,
+        })?;
+    let audio_format = AudioFormat::pcm_s16le(AUDIO_SAMPLE_RATE_HZ, u32::from(AUDIO_CHANNELS))
+        .expect("the camera audio format is valid");
+    let mut writer = MatroskaWriter::new(BufWriter::new(file), audio_format)?;
+    info!(
+        output = %arguments.output.display(),
+        audio_device = %arguments.audio_device,
+        audio_backend = ?arguments.audio_backend,
+        timestamp_accuracy,
+        audio_delay_ms = arguments.audio_delay_ms,
+        "synchronized capture started"
+    );
+
+    let result = run_capture_session(
+        &mut session,
+        session_origin,
+        &audio_events,
+        &mut writer,
+        arguments.audio_delay_ms,
+        &stopping,
+    );
+    session.stop();
+    let audio_result = audio_capture.stop();
+    result?;
+    audio_result?;
+    writer.flush()?;
+    info!(output = %arguments.output.display(), "synchronized capture stopped");
+    Ok(())
+}
+
+fn run_capture_session(
+    session: &mut UsbSession,
+    session_origin: Instant,
+    audio_events: &mpsc::Receiver<AudioCaptureEvent>,
+    writer: &mut MatroskaWriter<BufWriter<fs::File>>,
+    audio_delay_ms: i64,
+    stopping: &AtomicBool,
+) -> Result<(), AppError> {
+    let mut decoder = StreamDecoder::new();
+    let mut synchronizer = AvSynchronizer::new(MonotonicTimestamp::ZERO);
+    let mut video_source_discontinuity = false;
+    let mut video_frames = 0_u64;
+    let mut audio_chunks = 0_u64;
+    let mut maximum_video_drift_us = 0_u64;
+    let mut maximum_audio_drift_us = 0_u64;
+    let mut next_report = Instant::now() + Duration::from_secs(10);
+
+    loop {
+        if stopping.load(Ordering::Relaxed) {
+            if audio_chunks == 0 {
+                return Err(AppError::NoCapturedAudio);
+            }
+            if video_frames == 0 {
+                return Err(AppError::NoCapturedVideo);
+            }
+            info!(
+                video_frames,
+                audio_chunks,
+                maximum_video_drift_us,
+                maximum_audio_drift_us,
+                "final capture timing"
+            );
+            return Ok(());
+        }
+        let mut media_events = Vec::new();
+        for event in audio_events.try_iter() {
+            match event {
+                AudioCaptureEvent::Chunk(chunk) => {
+                    media_events.push(TimedMediaEvent::Audio(chunk));
+                }
+                AudioCaptureEvent::Failed(error) => return Err(AppError::AudioWorker(error)),
+                AudioCaptureEvent::Closed => return Err(AppError::AudioClosed),
+            }
+        }
+
+        let usb_events = match session.poll(Duration::from_millis(10)) {
+            Ok(events) => events,
+            Err(_) if stopping.load(Ordering::Relaxed) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for event in usb_events {
+            match event {
+                SessionEvent::Packet {
+                    endpoint,
+                    data,
+                    received_at,
+                } => match decoder.push_packet(EndpointPacket {
+                    endpoint,
+                    data: &data,
+                }) {
+                    Ok(Some(frame)) => {
+                        let frame_duration =
+                            Duration::from_millis(u64::from(frame.timestamp_delta_to_next_ms));
+                        let observed_start = received_at
+                            .checked_sub(frame_duration)
+                            .unwrap_or(received_at);
+                        media_events.push(TimedMediaEvent::Video(TimedVideoFrame {
+                            observed_at: monotonic_timestamp(session_origin, observed_start),
+                            source_discontinuity: std::mem::take(&mut video_source_discontinuity),
+                            frame,
+                        }));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(%error, "discarding malformed camera record during capture");
+                        decoder.reset();
+                        video_source_discontinuity = true;
+                    }
+                },
+                SessionEvent::PacketError { endpoint, status } => {
+                    warn!(?endpoint, status, "isochronous packet error during capture");
+                    decoder.reset();
+                    video_source_discontinuity = true;
+                }
+                event if event.ends_session() => {
+                    return Err(AppError::Sink(format!("camera disconnected: {event:?}")));
+                }
+                _ => {}
+            }
+        }
+
+        media_events.sort_by_key(event_observed_timestamp);
+        for event in media_events {
+            let timing = synchronizer
+                .event_timing(&event)
+                .map_err(|error| AppError::Sink(error.to_string()))?;
+            match &event {
+                TimedMediaEvent::Video(_) => {
+                    maximum_video_drift_us =
+                        maximum_video_drift_us.max(timing.observed_drift_us.unsigned_abs());
+                }
+                TimedMediaEvent::Audio(_) => {
+                    maximum_audio_drift_us =
+                        maximum_audio_drift_us.max(timing.observed_drift_us.unsigned_abs());
+                }
+            }
+            if timing.discontinuity {
+                warn!(
+                    pts_us = timing.pts_us,
+                    drift_us = timing.observed_drift_us,
+                    "capture discontinuity"
+                );
+            }
+            match event {
+                TimedMediaEvent::Video(frame) => {
+                    writer.write_video(&frame, timing)?;
+                    video_frames += 1;
+                }
+                TimedMediaEvent::Audio(chunk) => {
+                    writer.write_audio(&chunk, apply_audio_delay(timing, audio_delay_ms))?;
+                    audio_chunks += 1;
+                }
+            }
+        }
+
+        if Instant::now() >= next_report {
+            info!(
+                video_frames,
+                audio_chunks, maximum_video_drift_us, maximum_audio_drift_us, "capture statistics"
+            );
+            writer.flush()?;
+            next_report = Instant::now() + Duration::from_secs(10);
+        }
+    }
+}
+
+fn apply_audio_delay(
+    mut timing: handycam_core::MediaTiming,
+    delay_ms: i64,
+) -> handycam_core::MediaTiming {
+    let magnitude_us = delay_ms.unsigned_abs().saturating_mul(1_000);
+    timing.pts_us = if delay_ms >= 0 {
+        timing.pts_us.saturating_add(magnitude_us)
+    } else {
+        timing.pts_us.saturating_sub(magnitude_us)
+    };
+    timing
+}
+
+fn monotonic_timestamp(origin: Instant, observed: Instant) -> MonotonicTimestamp {
+    let micros = observed
+        .checked_duration_since(origin)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u128::from(u64::MAX)) as u64;
+    MonotonicTimestamp::from_micros(micros)
+}
+
+fn event_observed_timestamp(event: &TimedMediaEvent) -> MonotonicTimestamp {
+    match event {
+        TimedMediaEvent::Video(frame) => frame.observed_at,
+        TimedMediaEvent::Audio(chunk) => chunk.observed_start,
+    }
+}
+
 fn run_stream(arguments: StreamArgs) -> Result<(), AppError> {
     let mut plan = load_plan(arguments.init_plan.as_ref())?;
     if let Some(value) = arguments.quality {
@@ -953,5 +1282,21 @@ mod tests {
         assert!(is_nominal_camera_delta(40));
         assert!(is_nominal_camera_delta(41));
         assert!(!is_nominal_camera_delta(42));
+    }
+
+    #[test]
+    fn applies_signed_audio_delay_only_to_presentation_time() {
+        let timing = handycam_core::MediaTiming {
+            pts_us: 100_000,
+            duration_us: 40_000,
+            observed_drift_us: -12,
+            discontinuity: true,
+        };
+        assert_eq!(apply_audio_delay(timing, 60).pts_us, 160_000);
+        assert_eq!(apply_audio_delay(timing, -30).pts_us, 70_000);
+        let shifted = apply_audio_delay(timing, 60);
+        assert_eq!(shifted.duration_us, timing.duration_us);
+        assert_eq!(shifted.observed_drift_us, timing.observed_drift_us);
+        assert_eq!(shifted.discontinuity, timing.discontinuity);
     }
 }

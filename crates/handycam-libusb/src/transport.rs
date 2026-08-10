@@ -106,7 +106,7 @@ pub enum SessionEvent {
         data: Vec<u8>,
         /// Host monotonic time captured at the start of the libusb callback.
         ///
-        /// A future ALSA adapter can correlate this with its monotonic capture
+        /// The capture pipeline correlates this with ALSA's monotonic capture
         /// timestamp without relying on the camera's occasionally frozen
         /// 11-bit video timestamp.
         received_at: Instant,

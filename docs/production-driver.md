@@ -1,14 +1,14 @@
 # Production userspace driver
 
-The Rust implementation captures live record-mode video directly from a Sony
-DCR-HC24 and emits either an MJPEG stream, raw YUYV frames, or a V4L2 virtual
-camera. It does not use the Windows VM or Sony driver.
+The Rust implementation captures a Sony DCR-HC24 directly and emits an MJPEG
+stream, raw YUYV frames, a V4L2 virtual camera, or a synchronized MJPEG/PCM
+Matroska file. It does not use the Windows VM or Sony driver.
 
 ## Build
 
-Install a stable Rust toolchain, `libusb-1.0` development files, Clang, and
-the V4L2 headers. The optional V4L2 path also needs `v4l2loopback`; stdout
-does not.
+Install a stable Rust toolchain, `libusb-1.0` and ALSA development files,
+Clang, and the V4L2 headers. The optional V4L2 path also needs
+`v4l2loopback`; stdout and Matroska file capture do not.
 
 ```sh
 . "$HOME/.cargo/env"
@@ -52,10 +52,49 @@ target/release/handycam stream --output - --semantic-init --quality 20 |
   ffmpeg -f mjpeg -framerate 25 -i - -c:v copy handycam.mkv
 ```
 
-### Capturing audio with the video pipe
+### Synchronized audio/video capture
 
-The driver emits video on stdout; the camera's audio interfaces remain
-available to ALSA. Find the device with `arecord -l`, then mux both inputs:
+The driver claims only the vendor video interface, leaving the camera's audio
+interfaces available to ALSA. Find the device with `arecord -l`, then use the
+native timestamp-preserving path:
+
+```sh
+target/release/handycam capture \
+  --output handycam-synced.mkv \
+  --audio-device hw:1,0 \
+  --audio-delay-ms 60 \
+  --semantic-init \
+  --quality 20
+```
+
+This writes MJPEG and PCM directly to a Matroska file. It refuses to overwrite
+an existing output. Direct ALSA is the default and derives the first-sample
+time from monotonic PCM status, available captured frames, and sample count.
+The `--audio-backend arecord` fallback estimates timestamps from delivery time.
+Use a clap or flash test to validate alignment on the host. A positive
+`--audio-delay-ms` delays audio at muxing time without changing clock-drift
+diagnostics; negative values advance it. Repeated DCR-HC24 clap tests validated
+`--audio-delay-ms 60` as the current recommended calibration. The default is
+zero so other cameras, capture modes, USB controllers, and platform backends
+do not silently inherit a device-specific assumption.
+
+The need for this delay does not indicate clock drift. Direct ALSA timestamps
+locate PCM relative to the audio hardware position, but video content incurs a
+fixed pipeline delay from sensor exposure/readout, JPEG encoding and buffering,
+USB packetization, and host frame reconstruction. In addition, the Sony stream
+decoder finishes one JPEG only when the next record header establishes its end.
+The audio can therefore be timestamped earlier than the visible frame carrying
+the same real-world event. A muxing-time audio delay compensates for that fixed
+content latency while leaving sample counts, camera timestamps, and drift
+measurements untouched.
+
+Treat 60 ms as a calibration value rather than a protocol constant. Recheck it
+with a visible and audible event after changing record/playback mode, camera
+model, transport backend, or host hardware. A constant offset at every test
+point calls for this option; an offset that grows over time indicates clock
+drift and requires a different correction.
+
+For the external FFmpeg compatibility path:
 
 ```sh
 target/release/handycam stream --output - --semantic-init --quality 20 |
@@ -71,8 +110,8 @@ start transport from another terminal with `handycam transport play`.
 The independent ALSA and camera clocks can produce a small offset; use
 FFmpeg's `-itsoffset` on the audio input when calibrating a recording.
 
-The planned native timestamped capture path is documented in
-[A/V synchronization next steps](next-steps-av-sync.md).
+The timestamp model, validation results, and known limits are documented in
+[A/V synchronization design and validation](av-sync.md).
 
 For applications that need uncompressed frames:
 
@@ -115,14 +154,14 @@ target/release/handycam transport pause
 target/release/handycam transport stop
 ```
 
-Fast-forward and Rewind are available as `fast-forward` and `rewind`. The
-current interface is explicitly experimental. By default it derives the
-current sequence from the high nibble of status byte 0, increments it, and
-wraps after 15. `--current-sequence` remains available for exact protocol
-experiments. The command reports the exact word, status before/after, and
-every changed status byte. It waits 500 ms by default so the physical state
-in byte 2 has time to settle; override that only for protocol timing
-experiments.
+Fast-forward and Rewind are available as `fast-forward` and `rewind`. All five
+operations are live-validated. By default the command derives the current
+sequence from the high nibble of status byte 0, increments it, and wraps after
+15. `--current-sequence` remains available for exact protocol experiments.
+The command reports the exact word, status before/after, and every changed
+status byte. It waits 500 ms by default so the physical state in byte 2 has
+time to settle; override that only for protocol timing experiments. Secondary
+Sony shuttle/state commands are not decoded.
 
 Transport transitions can yield a single MJPEG entropy-concealment warning in
 FFmpeg even when USB framing remains intact. Pillow decoded every frame in
@@ -278,8 +317,8 @@ retain exact literal replay as a diagnostic fallback.
 
 `--quality` selects the startup JPEG scale factor from 4 through 128. Larger
 values produce smaller, lower-quality frames. Values 4, 20, 40, 80, and 128
-have all passed live capture and decode tests. Runtime quality switching is
-not yet exposed.
+have all passed live capture and decode tests. Mid-stream quality changes are
+not exposed or validated.
 
 ## Runtime behavior
 
@@ -311,23 +350,29 @@ The Cargo workspace separates:
 - `handycam-core`: a safe, platform-neutral state machine, initialization
   representation, JPEG reconstruction, and YUYV conversion;
 - `handycam-libusb`: the native USB transport and its narrowly contained
-  unsafe libusb transfer lifecycle; and
-- `handycam-cli`: Linux stdout and V4L2 sinks plus process supervision.
+  unsafe libusb transfer lifecycle;
+- `handycam-linux-audio`: direct timestamped ALSA capture and the `arecord`
+  fallback;
+- `handycam-matroska`: the streaming MJPEG/PCM Matroska writer; and
+- `handycam-cli`: Linux stdout and V4L2 sinks, synchronized capture, and
+  process supervision.
 
 The V4L2 sink uses one `write(2)` call per complete frame. This preserves the
 variable byte count of each MJPEG frame and avoids reusing a memory-mapped
 output buffer before a loopback consumer has finished with it.
 
-`handycam-core` builds for `wasm32-unknown-unknown`. A future WebUSB backend
-can provide individual endpoint packets to the same `StreamDecoder`.
+`handycam-core` builds for `wasm32-unknown-unknown`. Its packet, timed-media,
+and synchronization interfaces do not depend on libusb, ALSA, or Linux. A
+macOS, Windows, or browser port would need platform capture adapters and a
+common monotonic-clock mapping; those adapters are not implemented.
 
 The platform-neutral core contains a typed, tested encoder for Play, Pause,
 Stop, Fast-forward, and Rewind recovered from Sony's original application.
 All five operations, status transitions, repeated commands, and sequence
-wraparound are live-validated. The Linux CLI exposes them through an
-experimental one-shot command while a persistent stateful control API remains
-future work.
+wraparound are live-validated. The Linux CLI exposes them as one-shot
+commands; it does not provide a persistent control API.
 
-Native USB packet events also carry a host monotonic timestamp captured at
-libusb callback entry. This is the clock handoff needed by a future ALSA
-adapter; the current V4L2 and stdout video sinks do not yet consume it.
+Native USB packet events carry a host monotonic timestamp captured at libusb
+callback entry. `capture` correlates those observations with direct ALSA's
+monotonic PCM status timestamps in `AvSynchronizer`. V4L2 and stdout remain
+video-only sinks and therefore do not consume the audio timeline.

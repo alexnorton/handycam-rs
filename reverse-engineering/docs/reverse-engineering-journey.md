@@ -328,7 +328,7 @@ The difficult uncertainty is gone. We can:
 - turn their raw entropy into standard JPEG; and
 - mux the result as ordinary MJPEG video.
 
-The remaining work is engineering:
+At that point, the remaining work was engineering:
 
 - decode and emit frames live rather than in an offline pass;
 - record standard USB audio through ALSA and synchronize it;
@@ -336,6 +336,10 @@ The remaining work is engineering:
 - add persistent udev permissions;
 - expose frames to GStreamer or `v4l2loopback`; and
 - test longer sessions, reconnects, and tape playback.
+
+Most of that list is now implemented: the production driver performs live
+decode, ALSA synchronization, Matroska capture, V4L2 output, and primary tape
+transport. Long-duration drift and fault-injection tests remain open.
 
 That is a much better class of problem than “why does this obsolete XP
 application sometimes freeze and sometimes blue-screen?” The camera's
@@ -370,8 +374,10 @@ Matroska sample, with every video PTS and the audio start derived from the USB
 clock. The frozen picture belonged to the Windows timestamp path, not the
 camera data.
 
-Those discoveries changed the remaining task again. It is no longer “replay
-223 mysterious operations forever.” It is a staged replacement exercise:
-generate the named register phases, poll demonstrated state, add known
-quality control, learn transport commands from differential playback traces,
-and keep the original capture as a regression oracle throughout.
+Those discoveries changed the task again. It was no longer “replay 223
+mysterious operations forever,” but a staged replacement exercise. The
+production implementation now performs live decoding, timestamped ALSA
+capture, synchronized Matroska muxing, V4L2 output, semantic startup polling,
+quality selection, and the five primary transport operations. Literal startup
+replay remains available as the regression oracle while the remaining unnamed
+registers and secondary commands are investigated.

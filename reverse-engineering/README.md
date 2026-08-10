@@ -5,7 +5,7 @@ understand the Sony DCR-HC24 USB protocol. It is intentionally separate from
 the production Rust implementation in `crates/`.
 
 - `PROTOCOL.md` records the current protocol findings and known limitations.
-- `docs/` contains the research narrative and follow-on investigation plan.
+- `docs/` contains the research narrative and current protocol research status.
 - `experiments/` contains dated test notes and validation records.
 - `tools/` contains analysis, extraction, and VM-control utilities.
 - `vm/` contains the libvirt/QEMU definitions and access helpers used during
